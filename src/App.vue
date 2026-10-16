@@ -12,6 +12,8 @@ const recording = ref(false)
 const paused = ref(false)
 const error = ref('')
 const videoUrl = ref('')
+const showSettings = ref(false)
+const recordingSeconds = ref(0)
 
 let stream: MediaStream | null = null
 let recorder: MediaRecorder | null = null
@@ -19,6 +21,7 @@ let chunks: Blob[] = []
 let rafId = 0
 let lastTime = 0
 let scrollOffset = 0
+let recordingTimerId = 0
 
 const speedLabel = computed(() => `${speed.value} px/s`)
 
@@ -177,12 +180,15 @@ function startRecording() {
       recording.value = false
       paused.value = false
       cancelAnimationFrame(rafId)
+      stopRecordingTimer()
     }
 
     recorder.start(1000)
     recording.value = true
     paused.value = false
     scrollOffset = 0
+    recordingSeconds.value = 0
+    startRecordingTimer()
 
     if (promptEl.value) promptEl.value.scrollTop = 0
     draw()
@@ -199,10 +205,26 @@ function togglePause() {
     if (recorder.state === 'paused') recorder.resume()
     paused.value = false
     startScroll()
+    startRecordingTimer()
   } else {
     if (recorder.state === 'recording') recorder.pause()
     paused.value = true
     cancelAnimationFrame(rafId)
+    stopRecordingTimer()
+  }
+}
+
+function startRecordingTimer() {
+  stopRecordingTimer()
+  recordingTimerId = window.setInterval(() => {
+    recordingSeconds.value++
+  }, 1000)
+}
+
+function stopRecordingTimer() {
+  if (recordingTimerId) {
+    clearInterval(recordingTimerId)
+    recordingTimerId = 0
   }
 }
 
@@ -221,6 +243,15 @@ function resetPrompt() {
   scrollOffset = 0
   lastTime = 0
   if (promptEl.value) promptEl.value.scrollTop = 0
+}
+
+function openSettings() {
+  if (recording.value) return
+  showSettings.value = true
+}
+
+function closeSettings() {
+  showSettings.value = false
 }
 
 async function saveVideo() {
@@ -253,6 +284,7 @@ async function saveVideo() {
 
 onBeforeUnmount(() => {
   cancelAnimationFrame(rafId)
+  stopRecordingTimer()
   stream?.getTracks().forEach(track => track.stop())
   if (videoUrl.value) URL.revokeObjectURL(videoUrl.value)
 })
@@ -260,8 +292,6 @@ onBeforeUnmount(() => {
 
 <template>
   <main class="app">
-    <h1>我的提词器</h1>
-
     <section class="camera">
       <video
           ref="videoEl"
@@ -273,30 +303,58 @@ onBeforeUnmount(() => {
       <div class="prompt" ref="promptEl">
         <p>{{ script || '请在下方输入你的台词' }}</p>
       </div>
-      <span v-if="recording" class="rec">● REC</span>
+      <span v-if="recording" class="rec">● REC {{ recordingSeconds }} 秒</span>
     </section>
 
-    <label class="field-label">口播台词</label>
-    <textarea
-        v-model="script"
-        :disabled="recording"
-        placeholder="输入或粘贴你的台词……"
-        rows="5"
-    />
-
-    <label class="field-label">
-      滚动速度：{{ speedLabel }}
-    </label>
-    <input
-        v-model.number="speed"
-        type="range"
-        min="10"
-        max="100"
-        step="5"
-        :disabled="recording"
-    />
-
     <p v-if="error" class="error">{{ error }}</p>
+
+    <button
+        class="fab"
+        @click="openSettings"
+        :disabled="recording"
+        aria-label="设置"
+    >
+      <svg viewBox="0 0 24 24" width="22" height="22" fill="none"
+           stroke="currentColor" stroke-width="2" stroke-linecap="round"
+           stroke-linejoin="round">
+        <path d="M12 20h9" />
+        <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+      </svg>
+    </button>
+
+    <div v-if="showSettings" class="modal-overlay" @click.self="closeSettings">
+      <div class="modal-content">
+        <button class="modal-close" @click="closeSettings" aria-label="关闭">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none"
+               stroke="currentColor" stroke-width="2.4" stroke-linecap="round"
+               stroke-linejoin="round">
+            <line x1="6" y1="6" x2="18" y2="18" />
+            <line x1="18" y1="6" x2="6" y2="18" />
+          </svg>
+        </button>
+
+        <textarea
+            v-model="script"
+            :disabled="recording"
+            placeholder="输入或粘贴你的台词……"
+            rows="16"
+        />
+
+        <label class="field-label">
+          滚动速度：{{ speedLabel }}
+        </label>
+        <input
+            v-model.number="speed"
+            type="range"
+            min="10"
+            max="100"
+            step="5"
+            :disabled="recording"
+        />
+
+        <button class="modal-save" @click="closeSettings">完成</button>
+      </div>
+    </div>
 
     <div class="actions">
       <button v-if="!cameraReady" @click="openCamera">
