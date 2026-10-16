@@ -119,10 +119,10 @@ function startRecording() {
       ctx.fillStyle = '#000'
       ctx.fillRect(0, 0, W, H)
 
-      // Cover-fit: scale to fill the canvas, cropping the sides when the
-      // source is wider than the canvas. iOS Safari give us upright frames
-      // (just wider than tall), so we do not rotate — only mirror for selfie.
-      const scale = Math.max(W / vw, H / vh)
+      // Fit (letterbox): scale to fit canvas without cropping. Source from
+      // iOS Safari is wider than tall, so vertical bars appear top and bottom
+      // — same look as the native camera app preview.
+      const scale = Math.min(W / vw, H / vh)
       const dw = vw * scale
       const dh = vh * scale
 
