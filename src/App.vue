@@ -115,24 +115,20 @@ function startRecording() {
     if (!paused.value) {
       const vw = video.videoWidth || 1920
       const vh = video.videoHeight || 1080
-      const isLandscape = vw > vh
 
       ctx.fillStyle = '#000'
       ctx.fillRect(0, 0, W, H)
 
-      // Cover-fit: scale video so it fills the canvas (with cropping allowed).
-      // If source is landscape (common on iOS Safari), also rotate it so the
-      // short side of the source ends up as the short side of the canvas.
-      const scale = isLandscape
-        ? Math.max(W / vh, H / vw)
-        : Math.max(W / vw, H / vh)
+      // Cover-fit: scale to fill the canvas, cropping the sides when the
+      // source is wider than the canvas. iOS Safari give us upright frames
+      // (just wider than tall), so we do not rotate — only mirror for selfie.
+      const scale = Math.max(W / vw, H / vh)
       const dw = vw * scale
       const dh = vh * scale
 
       ctx.save()
       ctx.translate(W / 2, H / 2)
       ctx.scale(-1, 1)
-      if (isLandscape) ctx.rotate(Math.PI / 2)
       ctx.drawImage(video, -dw / 2, -dh / 2, dw, dh)
       ctx.restore()
     }
