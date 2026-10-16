@@ -100,6 +100,33 @@ function startRecording() {
     return
   }
 
+  const video = videoEl.value
+  if (!video) return
+
+  const canvas = document.createElement('canvas')
+  canvas.width = 1080
+  canvas.height = 1920
+  const ctx = canvas.getContext('2d')!
+  const W = canvas.width
+  const H = canvas.height
+
+  const draw = () => {
+    if (!recording.value) return
+    if (!paused.value) {
+      const vw = video.videoWidth || 1080
+      const vh = video.videoHeight || 1920
+      ctx.fillStyle = '#000'
+      ctx.fillRect(0, 0, W, H)
+      ctx.save()
+      ctx.translate(W / 2, H / 2)
+      ctx.rotate(Math.PI / 2)
+      ctx.scale(-1, 1)
+      ctx.drawImage(video, -vh / 2, -vw / 2, vh, vw)
+      ctx.restore()
+    }
+    requestAnimationFrame(draw)
+  }
+
   try {
     chunks = []
 
@@ -110,9 +137,12 @@ function startRecording() {
       'video/webm',
     ].find(type => MediaRecorder.isTypeSupported(type))
 
+    const canvasStream = canvas.captureStream(30)
+    stream.getAudioTracks().forEach(t => canvasStream.addTrack(t))
+
     recorder = mimeType
-        ? new MediaRecorder(stream, { mimeType })
-        : new MediaRecorder(stream)
+        ? new MediaRecorder(canvasStream, { mimeType })
+        : new MediaRecorder(canvasStream)
 
     recorder.ondataavailable = event => {
       if (event.data.size > 0) chunks.push(event.data)
@@ -136,6 +166,7 @@ function startRecording() {
     scrollOffset = 0
 
     if (promptEl.value) promptEl.value.scrollTop = 0
+    draw()
     startScroll()
   } catch (e) {
     error.value = e instanceof Error ? e.message : '启动录像失败'
