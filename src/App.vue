@@ -26,6 +26,16 @@ async function openCamera() {
   error.value = ''
 
   try {
+    // Lock to portrait so iOS Safari has a chance of returning a portrait
+    // MediaStream. Webkit doesn't honor this reliably, but it's worth a try.
+    if (screen.orientation?.lock) {
+      try {
+        await screen.orientation.lock('portrait')
+      } catch {
+        // user denied or unsupported — fall through to landscape stream + canvas
+      }
+    }
+
     if (!navigator.mediaDevices?.getUserMedia) {
       throw new Error('当前浏览器不支持摄像头访问，请使用最新版 iPhone Safari 和 HTTPS。')
     }
@@ -34,9 +44,10 @@ async function openCamera() {
       audio: true,
       video: {
         facingMode: 'user',
-        width: { ideal: 1080 },
-        height: { ideal: 1920 },
-      },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 },
+        frameRate: { ideal: 30, max: 30 },
+      }
     })
 
     if (videoEl.value) {
