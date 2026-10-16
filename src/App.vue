@@ -15,7 +15,7 @@ const videoUrl = ref('')
 
 let stream: MediaStream | null = null
 let recorder: MediaRecorder | null = null
-let chunks: BlobPart[] = []
+let chunks: Blob[] = []
 let rafId = 0
 let lastTime = 0
 let scrollOffset = 0
