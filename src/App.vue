@@ -26,10 +26,7 @@ const FRAME_INTERVAL = 1000 / TARGET_FPS
 let stream: MediaStream | null = null
 let recorder: MediaRecorder | null = null
 let canvasStream: MediaStream | null = null
-let canvasTrack: CanvasCaptureMediaStreamTrack | null = null
-let audioCtx: AudioContext | null = null
 let canvasCtx: CanvasRenderingContext2D | null = null
-let useRequestFrame = false
 let rafId = 0
 let drawRafId = 0
 let lastTime = 0
@@ -116,32 +113,6 @@ function startScroll() {
   rafId = requestAnimationFrame(animateScroll)
 }
 
-/**
- * 麦克风音轨通过 AudioContext 重新生成一路。
- * 直接把 live 音轨塞进 canvas 流时，音频与画面的时钟基准不一致，
- * Safari 混流后 mp4 的 media duration 会算错。
- */
-async function createAudioTrack(): Promise<MediaStreamTrack | null> {
-  const micTracks = stream?.getAudioTracks() ?? []
-  if (!micTracks.length) return null
-
-  const AudioCtor = window.AudioContext ?? (window as any).webkitAudioContext
-  if (!AudioCtor) return micTracks[0]
-
-  try {
-    const ctx = new AudioCtor() as AudioContext
-    await ctx.resume()
-    const source = ctx.createMediaStreamSource(new MediaStream(micTracks))
-    const dest = ctx.createMediaStreamDestination()
-    source.connect(dest)
-    audioCtx = ctx
-    return dest.stream.getAudioTracks()[0] ?? null
-  } catch (e) {
-    console.warn('音频重采样失败，退回原始音轨', e)
-    return micTracks[0]
-  }
-}
-
 function drawFrame() {
   const video = videoEl.value
   if (!video) return
@@ -184,7 +155,6 @@ function startDrawLoop() {
     lastFrameAt = now
 
     drawFrame()
-    if (useRequestFrame && canvasTrack) canvasTrack.requestFrame()
   }
 
   drawRafId = requestAnimationFrame(draw)
@@ -218,18 +188,13 @@ async function startRecording() {
   canvasCtx = canvas.getContext('2d')
 
   try {
-    // captureStream(0) + requestFrame() = 严格恒定帧率；
-    // 老 Safari 不支持 requestFrame 时退回 captureStream(30)。
-    const audioTrack = await createAudioTrack()
+    // 固定帧率采集（不要用 captureStream(0)+requestFrame：
+    // iOS Safari 上 requestFrame 不可靠，会只录到一两帧）
+    canvasStream = canvas.captureStream(TARGET_FPS)
 
-    const canRequestFrame =
-      typeof CanvasCaptureMediaStreamTrack !== 'undefined' &&
-      typeof CanvasCaptureMediaStreamTrack.prototype.requestFrame === 'function'
-
-    useRequestFrame = canRequestFrame
-    canvasStream = canRequestFrame ? canvas.captureStream(0) : canvas.captureStream(TARGET_FPS)
-    canvasTrack = (canvasStream.getVideoTracks()[0] as CanvasCaptureMediaStreamTrack) ?? null
-
+    // 直接用麦克风原始音轨（不要绕 AudioContext：
+    // 重新生成的音轨时间戳基准不同，会让 mp4 音轨时间轴错乱）
+    const audioTrack = stream.getAudioTracks()[0]
     if (audioTrack) canvasStream.addTrack(audioTrack)
 
     const mimeType = [
@@ -272,17 +237,18 @@ async function startRecording() {
       // 实际录制时长（秒），用于容器时间戳不可信时兜底
       const elapsed = Math.max(0, (performance.now() - recordStartAt - pausedTotal) / 1000)
 
-      // Safari 的 fragmented mp4 里 moov 的 duration 常是错的，
-      // 这里按实际采样时间重算并回写，修正相册里的时长与进度条。
+      // Safari 的 mp4 时间轴（moof/tfdt/trun、stts）经常是坏的：
+      // 播放器按样本时间轴算时长，只改 moov 头部没有用。
+      // 这里重建分片时间轴、把各轨样本时长缩放到真实录制时长。
       try {
         const fixed = await fixMp4Duration(blob, elapsed)
         blob = fixed.blob
-        if (fixed.changed) {
-          const stored = fixed.analysis.storedMovieDuration / fixed.analysis.movieTimescale
-          durationNote.value = Math.abs(stored - fixed.targetDuration) > 0.05
-            ? `已修正容器时长（原始标注 ${stored.toFixed(1)}s → ${fixed.targetDuration.toFixed(1)}s）`
-            : `已修正容器时长字段（${fixed.targetDuration.toFixed(1)}s）`
-        }
+        const stored = fixed.analysis.storedMovieDuration / fixed.analysis.movieTimescale
+        const parts = [`录制 ${elapsed.toFixed(1)}s`]
+        parts.push(fixed.changed ? `容器已修正 → ${fixed.targetDuration.toFixed(1)}s` : '容器未改动')
+        parts.push(`原始标注 ${stored.toFixed(1)}s`)
+        if (fixed.report) parts.push(fixed.report)
+        durationNote.value = parts.join(' ｜ ')
       } catch (e) {
         console.warn('修正 mp4 时长失败', e)
       }
@@ -337,13 +303,7 @@ function cleanupCapture() {
     canvasStream.getTracks().forEach(t => t.stop())
     canvasStream = null
   }
-  canvasTrack = null
-  useRequestFrame = false
   canvasCtx = null
-  if (audioCtx) {
-    audioCtx.close().catch(() => {})
-    audioCtx = null
-  }
 }
 
 function probeDuration(url: string): Promise<number> {
@@ -360,14 +320,36 @@ function togglePause() {
   if (!recorder || !recording.value) return
 
   if (paused.value) {
-    if (recorder.state === 'paused') recorder.resume()
+    if (recorder.state === 'paused') {
+      try {
+        recorder.resume()
+      } catch (e) {
+        console.warn('resume 失败', e)
+      }
+    }
     paused.value = false
     pausedTotal += performance.now() - pausedAt
     lastFrameAt = 0
     startScroll()
     startRecordingTimer()
   } else {
-    if (recorder.state === 'recording') recorder.pause()
+    // 必须确认 recorder 真的暂停了：否则录像仍在继续，
+    // 而我们却把这段时间算作「暂停」，会导致实际录制时长算错。
+    let actuallyPaused = false
+    const stateBefore: string = recorder.state
+    try {
+      if (stateBefore === 'recording') recorder.pause()
+    } catch (e) {
+      console.warn('pause 失败', e)
+    }
+    const stateAfter: string = recorder.state
+    actuallyPaused = stateAfter === 'paused'
+
+    if (!actuallyPaused) {
+      error.value = '当前浏览器不支持暂停录制'
+      return
+    }
+
     paused.value = true
     pausedAt = performance.now()
     cancelAnimationFrame(rafId)

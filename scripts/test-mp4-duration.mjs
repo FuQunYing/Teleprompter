@@ -1,5 +1,5 @@
-// 构造 fragmented / 非 fragmented mp4，验证 fixMp4Duration 能把错误的 moov 时长改回来。
-// 运行：node --experimental-strip-types scripts/test-mp4-duration.mjs
+// 验证 fixMp4Duration：重建 fragmented mp4 的时间轴链 + 按真实时长缩放样本时长。
+// 运行：npm run test:mp4
 import { fixMp4Duration } from '../src/mp4Duration.ts'
 
 const enc = new TextEncoder()
@@ -28,7 +28,6 @@ function box(type, ...payloads) {
   return concat([head, body])
 }
 
-/** 扫描顶层 box，返回 {type, start, dataStart} */
 function topBoxes(bytes) {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
   const out = []
@@ -43,18 +42,99 @@ function topBoxes(bytes) {
   return out
 }
 
-/** 读文件里 mvhd.duration（原始值） */
-function readMvhdDuration(bytes) {
+/** 读回文件里 moov>mvhd 的 duration 与 timescale */
+function readMvhd(bytes) {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
   const moov = topBoxes(bytes).find(b => b.type === 'moov')
   if (!moov) return null
-  // moov 的第一个子 box 是 mvhd
-  const mvhdStart = moov.dataStart
-  const mvhdPayload = mvhdStart + 8
-  const version = dv.getUint8(mvhdPayload)
-  const offset = version === 1 ? mvhdPayload + 24 : mvhdPayload + 16
-  const value = version === 1 ? Number(dv.getBigUint64(offset)) : dv.getUint32(offset)
-  return { version, value, timescale: dv.getUint32(version === 1 ? mvhdPayload + 20 : mvhdPayload + 12) }
+  const payload = moov.dataStart + 8
+  const version = dv.getUint8(payload)
+  const offset = version === 1 ? payload + 24 : payload + 16
+  return {
+    version,
+    value: version === 1 ? Number(dv.getBigUint64(offset)) : dv.getUint32(offset),
+    timescale: dv.getUint32(version === 1 ? payload + 20 : payload + 12),
+  }
+}
+
+/** 读回所有 tfdt 的 baseMediaDecodeTime */
+function readTfdtValues(bytes) {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  const out = []
+  const walk = (start, end) => {
+    let p = start
+    while (p + 8 <= end) {
+      const size = dv.getUint32(p)
+      const type = String.fromCharCode(...bytes.slice(p + 4, p + 8))
+      const dataStart = p + 8
+      if (type === 'tfdt') {
+        const version = dv.getUint8(dataStart)
+        out.push(version === 1 ? Number(dv.getBigUint64(dataStart + 4)) : dv.getUint32(dataStart + 4))
+      } else if (['moov', 'trak', 'mdia', 'minf', 'moof', 'traf'].includes(type)) {
+        walk(dataStart, p + size)
+      }
+      if (size < 8) break
+      p += size
+    }
+  }
+  walk(0, bytes.length)
+  return out
+}
+
+/** 读回所有 trun 里样本的 duration */
+function readSampleDurations(bytes) {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  const out = []
+  const walk = (start, end) => {
+    let p = start
+    while (p + 8 <= end) {
+      const size = dv.getUint32(p)
+      const type = String.fromCharCode(...bytes.slice(p + 4, p + 8))
+      const dataStart = p + 8
+      if (type === 'trun') {
+        const flags = dv.getUint32(dataStart) & 0xffffff
+        const count = dv.getUint32(dataStart + 4)
+        let q = dataStart + 8
+        if (flags & 0x000001) q += 4
+        if (flags & 0x000004) q += 4
+        if (flags & 0x000100) {
+          for (let i = 0; i < count; i++) {
+            out.push(dv.getUint32(q))
+            q += 4
+          }
+        }
+      } else if (['moof', 'traf'].includes(type)) {
+        walk(dataStart, p + size)
+      }
+      if (size < 8) break
+      p += size
+    }
+  }
+  walk(0, bytes.length)
+  return out
+}
+
+/** 找到 stts box 并读回 delta */
+function readSttsDelta(bytes) {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  let found = null
+  const walk = (start, end) => {
+    let p = start
+    while (p + 8 <= end) {
+      const size = dv.getUint32(p)
+      const type = String.fromCharCode(...bytes.slice(p + 4, p + 8))
+      const dataStart = p + 8
+      if (type === 'stts') {
+        found = dv.getUint32(dataStart + 8 + 4)
+        return
+      }
+      if (['moov', 'trak', 'mdia', 'minf', 'stbl'].includes(type)) walk(dataStart, p + size)
+      if (size < 8) break
+      p += size
+    }
+  }
+  walk(0, bytes.length)
+  return found
 }
 
 const now = 0xe5f00000
@@ -62,28 +142,46 @@ const BAD = 73522000 // 垃圾时长：20:25:22
 
 const mvhd = (duration, timescale = 1000) =>
   box('mvhd', u32(0), u32(now), u32(now), u32(timescale), u32(duration))
-
 const tkhd = (trackId, duration) =>
   box('tkhd', u32(0), u32(now), u32(now), u32(trackId), u32(0), u32(duration), new Uint8Array(60))
-
 const mdhd = (timescale, duration) =>
   box('mdhd', u32(0), u32(now), u32(now), u32(timescale), u32(duration))
-
 const hdlr = kind =>
   box('hdlr', u32(0), u32(0), enc.encode(kind), new Uint8Array(12), enc.encode('x\0'))
-
-const stbl = box('stbl', box('stsd', u32(0), u32(0)), box('stts', u32(0), u32(0)))
-const minf = box('minf', stbl)
+const stblEmpty = box('stbl', box('stsd', u32(0), u32(0)), box('stts', u32(0), u32(0)))
+const minf = box('minf', stblEmpty)
 const ftyp = box('ftyp', enc.encode('isom'), u32(512), enc.encode('isomiso6mp41'))
-const mdat = box('mdat', new Uint8Array(1024))
-
+const mdat = box('mdat', new Uint8Array(512))
 const tfhd = (trackId, defaultSampleDuration) =>
   box('tfhd', u32(0x000008), u32(trackId), u32(defaultSampleDuration))
-const tfdt = box('tfdt', u32(0), u32(0))
 const trun = (sampleCount, perSampleDuration) => {
   const parts = [u32(perSampleDuration ? 0x000100 : 0), u32(sampleCount)]
   if (perSampleDuration) for (let i = 0; i < sampleCount; i++) parts.push(u32(perSampleDuration))
   return box('trun', ...parts)
+}
+
+/** 造一个 fragmented 文件：每轨 trackId 个分片，每片 samplesPerFrag 个样本 */
+function makeFragmented({ trackIds, timescale, samplesPerFrag, sampleDuration, tfdtMode }) {
+  const moov = box('moov', mvhd(0),
+    ...trackIds.map(id => box('trak', tkhd(id, 0),
+      box('mdia', mdhd(timescale, 0), hdlr(id === 1 ? 'vide' : 'soun'), minf))))
+
+  const parts = [ftyp, moov]
+  for (const id of trackIds) {
+    for (let f = 0; f < samplesPerFrag.fragments; f++) {
+      let tfdtValue = 0
+      if (tfdtMode === 'cumulative') tfdtValue = f * samplesPerFrag.count * sampleDuration
+      else if (tfdtMode === 'allZero') tfdtValue = 0
+      else if (tfdtMode === 'hugeLast' && f === samplesPerFrag.fragments - 1) tfdtValue = BAD
+
+      parts.push(box('moof', box('mfhd', u32(f + 1)),
+        box('traf', tfhd(id, sampleDuration),
+          box('tfdt', u32(0), u32(tfdtValue)),
+          trun(samplesPerFrag.count, sampleDuration))))
+      parts.push(mdat)
+    }
+  }
+  return new Blob([concat(parts)], { type: 'video/mp4' })
 }
 
 let failures = 0
@@ -93,86 +191,109 @@ function check(name, actual, expected) {
   console.log(`${ok ? '  ok  ' : ' FAIL '} ${name}: ${actual}${ok ? '' : ` (期望 ${expected})`}`)
 }
 
-// ===================== 场景一：fragmented mp4 =====================
-console.log('--- 场景一：fragmented mp4（30 帧 @30fps + 30 帧 @48kHz）---')
-const moovFrag = box('moov',
-  mvhd(BAD),
-  box('trak', tkhd(1, BAD), box('mdia', mdhd(90000, BAD), hdlr('vide'), minf)),
-  box('trak', tkhd(2, BAD), box('mdia', mdhd(48000, BAD), hdlr('soun'), minf)))
-
-const moofVideo = box('moof', box('mfhd', u32(1)),
-  box('traf', tfhd(1, 3000), tfdt, trun(30, 3000)))
-const moofAudio = box('moof', box('mfhd', u32(2)),
-  box('traf', tfhd(2, 1600), tfdt, trun(30, 0)))
-
-const blob1 = new Blob([concat([ftyp, moovFrag, moofVideo, mdat, moofAudio, mdat])], { type: 'video/mp4' })
-const r1 = await fixMp4Duration(blob1)
-check('识别为 fragmented', r1.analysis.fragmented, true)
-check('原始标注时长(s)', r1.analysis.storedMovieDuration / r1.analysis.movieTimescale, 73522)
-check('计算出的真实时长(s)', r1.analysis.duration, 1)
-check('发生了修正', r1.changed, true)
+// ============ 场景一：tfdt 链正常，无需改动 ============
+console.log('--- 场景一：tfdt 链正常 ---')
+const b1 = makeFragmented({
+  trackIds: [1], timescale: 90000,
+  samplesPerFrag: { fragments: 10, count: 30 }, sampleDuration: 3000,
+  tfdtMode: 'cumulative',
+})
+const r1 = await fixMp4Duration(b1, 10)
+check('容器时间轴(s)', r1.analysis.duration, 10)
 const bytes1 = new Uint8Array(await r1.blob.arrayBuffer())
-check('文件内 mvhd.duration', readMvhdDuration(bytes1).value, 1000)
+check('mvhd.duration', readMvhd(bytes1).value, 10000)
+check('样本时长未被改动', readSampleDurations(bytes1).every(d => d === 3000), true)
 
-// 再跑一次应无变化
-const r1b = await fixMp4Duration(r1.blob)
-check('幂等：第二次不再改动', r1b.changed, false)
-
-// ===================== 场景二：非 fragmented mp4 =====================
-console.log('\n--- 场景二：非 fragmented mp4（stts）---')
-const stts = box('stts', u32(0), u32(1), u32(30), u32(3000)) // 30 帧 × 3000 = 90000 → 1s
-const stbl2 = box('stbl', box('stsd', u32(0), u32(0)), stts)
-const moovPlain = box('moov', mvhd(BAD),
-  box('trak', tkhd(1, BAD), box('mdia', mdhd(90000, BAD), hdlr('vide'), box('minf', stbl2))))
-const blob2 = new Blob([concat([ftyp, moovPlain, mdat])], { type: 'video/mp4' })
-const r2 = await fixMp4Duration(blob2)
-check('识别为非 fragmented', r2.analysis.fragmented, false)
-check('计算出的真实时长(s)', r2.analysis.duration, 1)
-check('发生了修正', r2.changed, true)
+// ============ 场景二：tfdt 全为 0（样本挤在开头）→ 重建时间轴 ============
+console.log('\n--- 场景二：tfdt 全为 0，重建分片时间轴 ---')
+const b2 = makeFragmented({
+  trackIds: [1], timescale: 90000,
+  samplesPerFrag: { fragments: 10, count: 30 }, sampleDuration: 3000,
+  tfdtMode: 'allZero',
+})
+const r2 = await fixMp4Duration(b2, 10)
 const bytes2 = new Uint8Array(await r2.blob.arrayBuffer())
-check('文件内 mvhd.duration', readMvhdDuration(bytes2).value, 1000)
+const tfdts2 = readTfdtValues(bytes2)
+check('分片数', tfdts2.length, 10)
+check('第一个 tfdt', tfdts2[0], 0)
+check('第二个 tfdt 应为前一片时长', tfdts2[1], 30 * 3000)
+check('最后一个 tfdt', tfdts2[9], 9 * 30 * 3000)
+check('mvhd.duration', readMvhd(bytes2).value, 10000)
 
-// ===================== 场景三：时长本来就正确 =====================
-console.log('\n--- 场景三：时长本来就正确，不应改动 ---')
-const moovOk = box('moov', mvhd(1000),
-  box('trak', tkhd(1, 1000), box('mdia', mdhd(90000, 90000), hdlr('vide'), box('minf', stbl2))))
-const blob3 = new Blob([concat([ftyp, moovOk, mdat])], { type: 'video/mp4' })
-const r3 = await fixMp4Duration(blob3)
-check('计算出的真实时长(s)', r3.analysis.duration, 1)
-check('未发生无谓改动', r3.changed, false)
+// ============ 场景三：样本时长是真实值的 2 倍 → 缩放 ============
+console.log('\n--- 场景三：容器时间轴是真实值的 2 倍，缩放样本时长 ---')
+const b3 = makeFragmented({
+  trackIds: [1], timescale: 90000,
+  samplesPerFrag: { fragments: 10, count: 30 }, sampleDuration: 6000, // 每片 2 秒
+  tfdtMode: 'cumulative',
+})
+const r3 = await fixMp4Duration(b3, 10)
+check('容器原始时间轴(s)', r3.analysis.duration, 20)
+const bytes3 = new Uint8Array(await r3.blob.arrayBuffer())
+const durations3 = readSampleDurations(bytes3)
+check('样本时长已减半', durations3[0], 3000)
+check('所有样本都已缩放', durations3.every(d => d === 3000), true)
+check('mvhd.duration', readMvhd(bytes3).value, 10000)
 
-// ===================== 场景六：容器时间戳是垃圾 → 用实际录制时长 =====================
-console.log('\n--- 场景六：分片时间戳是垃圾（8000s），传入实际录制时长 30s ---')
-const moofGarbage = box('moof', box('mfhd', u32(1)),
-  box('traf', tfhd(1, 24000000), tfdt, trun(30, 24000000)))
-const blob6 = new Blob([concat([ftyp, moovFrag, moofGarbage, mdat])], { type: 'video/mp4' })
-const r6 = await fixMp4Duration(blob6, 30)
-check('来源为实际录制时长', r6.source, 'expected')
-check('最终时长(s)', r6.targetDuration, 30)
+// ============ 场景四：最后一个 tfdt 是垃圾值 → 重建后不再有空洞 ============
+console.log('\n--- 场景四：最后一个分片的 tfdt 是垃圾值 ---')
+const b4 = makeFragmented({
+  trackIds: [1], timescale: 90000,
+  samplesPerFrag: { fragments: 10, count: 30 }, sampleDuration: 3000,
+  tfdtMode: 'hugeLast',
+})
+const r4 = await fixMp4Duration(b4, 10)
+const bytes4 = new Uint8Array(await r4.blob.arrayBuffer())
+const tfdts4 = readTfdtValues(bytes4)
+check('最后一个 tfdt 已被修正', tfdts4[9], 9 * 30 * 3000)
+check('mvhd.duration', readMvhd(bytes4).value, 10000)
+
+// ============ 场景五：非 fragmented（stts）→ 缩放 delta ============
+console.log('\n--- 场景五：非 fragmented mp4 ---')
+const stts = box('stts', u32(0), u32(1), u32(300), u32(6000)) // 300 帧 × 6000 = 1800000 → 20s
+const stbl5 = box('stbl', box('stsd', u32(0), u32(0)), stts)
+const moov5 = box('moov', mvhd(BAD),
+  box('trak', tkhd(1, BAD), box('mdia', mdhd(90000, BAD), hdlr('vide'), box('minf', stbl5))))
+const b5 = new Blob([concat([ftyp, moov5, mdat])], { type: 'video/mp4' })
+const r5 = await fixMp4Duration(b5, 10)
+check('容器原始时间轴(s)', r5.analysis.duration, 20)
+const bytes5 = new Uint8Array(await r5.blob.arrayBuffer())
+check('stts delta 已减半', readSttsDelta(bytes5), 3000)
+check('mvhd.duration', readMvhd(bytes5).value, 10000)
+
+// ============ 场景六：分片没有每样本时长，只能靠 tfdt ============
+console.log('\n--- 场景六：trun 无每样本时长（时长只在 tfdt 里）---')
+const trunNoDur = (sampleCount) => box('trun', u32(0), u32(sampleCount))
+function makeFragmentedNoDur({ fragments, count, sampleDuration }) {
+  const moov = box('moov', mvhd(0),
+    box('trak', tkhd(1, 0), box('mdia', mdhd(90000, 0), hdlr('vide'), minf)))
+  const parts = [ftyp, moov]
+  for (let f = 0; f < fragments; f++) {
+    parts.push(box('moof', box('mfhd', u32(f + 1)),
+      box('traf', box('tfhd', u32(0), u32(1)),
+        box('tfdt', u32(0), u32(f * count * sampleDuration)),
+        trunNoDur(count))))
+    parts.push(mdat)
+  }
+  return new Blob([concat(parts)], { type: 'video/mp4' })
+}
+const b6 = makeFragmentedNoDur({ fragments: 10, count: 30, sampleDuration: 3000 })
+const r6 = await fixMp4Duration(b6, 10)
+check('容器时间轴由 tfdt 推算(s)', r6.analysis.duration, 9)
 const bytes6 = new Uint8Array(await r6.blob.arrayBuffer())
-check('文件内 mvhd.duration', readMvhdDuration(bytes6).value, 30000)
+const tfdts6 = readTfdtValues(bytes6)
+check('tfdt 被按比例缩放', tfdts6[1], Math.round((1 * 30 * 3000) * (10 / 9)))
+check('mvhd.duration', readMvhd(bytes6).value, 10000)
 
-// ===================== 场景七：容器没有任何时间信息 =====================
-console.log('\n--- 场景七：容器无时间信息，用实际录制时长 ---')
-const blob7 = new Blob([concat([ftyp, moovFrag, mdat])], { type: 'video/mp4' })
-const r7 = await fixMp4Duration(blob7, 12.5)
-check('来源为实际录制时长', r7.source, 'expected')
-check('最终时长(s)', r7.targetDuration, 12.5)
-const bytes7 = new Uint8Array(await r7.blob.arrayBuffer())
-check('文件内 mvhd.duration', readMvhdDuration(bytes7).value, 12500)
-
-// ===================== 场景四：非 mp4（webm）原样返回 =====================
-console.log('\n--- 场景四：webm 原样返回 ---')
+// ============ 场景七：webm / 垃圾输入不崩 ============
+console.log('\n--- 场景七：webm 与垃圾输入 ---')
 const webm = new Blob([new Uint8Array([0x1a, 0x45, 0xdf, 0xa3])], { type: 'video/webm' })
-const r4 = await fixMp4Duration(webm)
-check('未修改', r4.changed, false)
-check('blob 体积不变', r4.blob.size, webm.size)
+const r7 = await fixMp4Duration(webm, 10)
+check('webm 未修改', r7.changed, false)
 
-// ===================== 场景五：垃圾输入不崩 =====================
-console.log('\n--- 场景五：垃圾输入 ---')
 const junk = new Blob([new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9])], { type: 'video/mp4' })
-const r5 = await fixMp4Duration(junk)
-check('未崩溃且原样返回', r5.changed, false)
+const r8 = await fixMp4Duration(junk, 10)
+check('垃圾输入未崩溃', r7.changed, false)
 
 console.log(failures === 0 ? '\n全部通过' : `\n${failures} 项失败`)
 process.exit(failures === 0 ? 0 : 1)
