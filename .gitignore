@@ -20,3 +20,6 @@ node_modules
 *.njsproj
 *.sln
 *.sw?
+
+# 排查用的上传文件
+uploads/

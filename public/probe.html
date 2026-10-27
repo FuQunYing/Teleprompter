@@ -1,0 +1,11 @@
+<!doctype html><meta charset="utf-8"><title>loading</title>
+<body style="font:28px monospace;padding:20px">读取中…<div id="out"></div>
+<video id="v" style="width:300px"></video>
+<script>
+const v = document.getElementById('v')
+v.src = new URLSearchParams(location.search).get('f')
+const show = d => { document.title = 'DUR:' + d; document.getElementById('out').textContent = 'duration = ' + d + ' 秒' }
+v.onloadedmetadata = () => show(v.duration)
+v.onerror = () => { document.title = 'DUR:error'; document.getElementById('out').textContent = '加载失败' }
+setTimeout(() => { if (document.title === 'loading') { document.title = 'DUR:timeout'; document.getElementById('out').textContent = '超时' } }, 15000)
+</script>

@@ -233,7 +233,38 @@ function readTrun(view: DataView, b: Box): { count: number; durations: Field[] }
   return { count, durations }
 }
 
-// --- 解析 ------------------------------------------------------------------
+// elst: version/flags(4) entry_count(4) entry[ segment_duration(4|8) media_time(4|8) rate(4) ]
+// segment_duration 的单位是影片时基（mvhd.timescale），所有 entry 之和就是「呈现时长」，
+// 播放器会用它来覆盖 mvhd.duration —— 这是 Safari 时长翻倍的常见来源。
+interface ElstEntry {
+  segmentDurationOffset: number
+  segmentDurationBytes: 4 | 8
+  segmentDuration: number
+  mediaTime: number
+}
+
+function readElst(view: DataView, b: Box): ElstEntry[] {
+  const v = versionOf(view, b)
+  const count = view.getUint32(b.dataStart + 4)
+  const entries: ElstEntry[] = []
+  const size = v === 1 ? 20 : 12
+  let p = b.dataStart + 8
+  for (let i = 0; i < count && p + size <= b.dataEnd; i++, p += size) {
+    const bytes = (v === 1 ? 8 : 4) as 4 | 8
+    const segmentDuration = readUint(view, p, bytes)
+    const mediaTime = v === 1
+      ? Number(view.getBigInt64(p + 8))
+      : view.getInt32(p + 4)
+    entries.push({
+      segmentDurationOffset: p,
+      segmentDurationBytes: bytes,
+      segmentDuration,
+      mediaTime,
+    })
+  }
+  return entries
+}
+
 
 interface TrackParse {
   trackId: number
@@ -243,6 +274,7 @@ interface TrackParse {
   tkhd: Box | null
   stts: SttsEntry[]
   fragments: Fragment[]
+  elst: ElstEntry[]
 }
 
 interface ParseResult {
@@ -275,6 +307,13 @@ function parse(buffer: ArrayBuffer): ParseResult | null {
     const hdlr = findBox(md, 'hdlr')
     const minf = findBox(md, 'minf')
 
+    const edts = findBox(tk, 'edts')
+    let elst: ElstEntry[] = []
+    if (edts) {
+      const elstBox = findBox(readBoxes(view, edts.dataStart, edts.dataEnd), 'elst')
+      if (elstBox) elst = readElst(view, elstBox)
+    }
+
     let stts: SttsEntry[] = []
     if (minf) {
       const stbl = findBox(readBoxes(view, minf.dataStart, minf.dataEnd), 'stbl')
@@ -290,6 +329,7 @@ function parse(buffer: ArrayBuffer): ParseResult | null {
       timescale: mdhd ? mdhdTimescale(view, mdhd) : movieTimescale,
       mdhd: mdhd ?? null,
       tkhd: tkhd ?? null,
+      elst,
       stts,
       fragments: [],
     })
@@ -480,6 +520,9 @@ export async function fixMp4Duration(input: Blob, expectedDuration?: number): Pr
     }
     // 缩放幅度过大说明数据不可信，宁可不动
     const scaleUsable = scale >= 0.5 && scale <= 2
+    // 样本时间轴通常是对的（差个百分之一来自录制启停），
+    // 只有偏差超过 10% 才认为时间轴本身坏了，需要整体缩放
+    const needScale = Math.abs(scale - 1) > 0.1
 
     if (t.fragments.length) {
       const totalSamples = t.fragments.reduce((s, f) => s + f.sampleCount, 0)
@@ -503,7 +546,7 @@ export async function fixMp4Duration(input: Blob, expectedDuration?: number): Pr
 
       if (allKnown) {
         // 1) 缩放样本时长
-        if (scaleUsable && scale !== 1) {
+        if (scaleUsable && needScale) {
           for (const f of t.fragments) {
             for (const d of f.sampleDurations) writeField(d, d.value * scale)
             if (!f.sampleDurations.length && f.defaultDuration) {
@@ -523,7 +566,7 @@ export async function fixMp4Duration(input: Blob, expectedDuration?: number): Pr
       } else {
         // 分片没有可用的时长信息：时间轴只能靠 tfdt，
         // 这时不能重建链（会抹掉唯一的时间信息），只能整体缩放 tfdt
-        if (scaleUsable && scale !== 1) {
+        if (scaleUsable && needScale) {
           for (const f of t.fragments) {
             if (f.tfdt) writeField(f.tfdt, f.tfdt.value * scale)
           }
@@ -536,7 +579,7 @@ export async function fixMp4Duration(input: Blob, expectedDuration?: number): Pr
       )
     } else if (t.stts.length) {
       // 非 fragmented：缩放 stts 的 delta
-      if (scaleUsable && scale !== 1) {
+      if (scaleUsable && needScale) {
         for (const e of t.stts) {
           writeField({ offset: e.deltaOffset, bytes: 4, value: e.delta }, e.delta * scale)
         }
@@ -545,6 +588,33 @@ export async function fixMp4Duration(input: Blob, expectedDuration?: number): Pr
       reportLines.push(
         `${info.kind}: timescale=${info.timescale} 样本=${info.sampleCount} 时间轴=${currentTimeline.toFixed(2)}s → ${(target).toFixed(2)}s${info.scaled ? '（已缩放）' : ''}`,
       )
+    }
+
+    // 4) 编辑列表：呈现时长的另一个来源，播放器优先用它
+    if (t.elst.length) {
+      const elstTotal = t.elst.reduce((s, e) => s + e.segmentDuration, 0)
+      const targetUnits = Math.round(target * movieTimescale)
+      if (elstTotal > 0 && targetUnits > 0) {
+        const elstScale = targetUnits / elstTotal
+        if (elstScale >= 0.5 && elstScale <= 2) {
+          let written = 0
+          t.elst.forEach((e, i) => {
+            const isLast = i === t.elst.length - 1
+            const value = isLast
+              ? targetUnits - written
+              : Math.round(e.segmentDuration * elstScale)
+            writeField(
+              { offset: e.segmentDurationOffset, bytes: e.segmentDurationBytes, value: 0 },
+              value,
+            )
+            written += value
+          })
+          info.scaled = true
+          reportLines.push(
+            `${info.kind}: elst ${elstTotal} → ${targetUnits}(影片时基 ${movieTimescale})`,
+          )
+        }
+      }
     }
 
     // 3) 同步 moov 里的时长
@@ -578,4 +648,103 @@ export async function fixMp4Duration(input: Blob, expectedDuration?: number): Pr
     source,
     report,
   }
+}
+
+// --- 诊断导出 ---------------------------------------------------------------
+
+/**
+ * 把 mp4 的 box 结构完整导成文本，方便排查「时长不对」这类问题。
+ * 只打印 box 结构与关键字段，不打印 mdat 里的编码数据。
+ */
+export async function dumpMp4Structure(input: Blob): Promise<string> {
+  let buffer: ArrayBuffer
+  try {
+    buffer = await input.arrayBuffer()
+  } catch {
+    return '读取失败'
+  }
+
+  const view = new DataView(buffer)
+  const lines: string[] = []
+  lines.push(`文件大小 ${(input.size / 1024 / 1024).toFixed(2)} MB, type=${input.type}`)
+
+  const describe = (b: Box): string => {
+    try {
+      switch (b.type) {
+        case 'mvhd': {
+          const v = versionOf(view, b)
+          const ts = mvhdTimescale(view, b)
+          const off = mvhdDurationOffset(view, b)
+          return `timescale=${ts} duration=${readUint(view, off.offset, off.bytes)} (${(readUint(view, off.offset, off.bytes) / ts).toFixed(3)}s) v${v}`
+        }
+        case 'tkhd': {
+          const v = versionOf(view, b)
+          const off = tkhdDurationOffset(view, b)
+          const flags = view.getUint32(b.dataStart) & 0xffffff
+          return `track_id=${tkhdTrackId(view, b)} duration=${readUint(view, off.offset, off.bytes)} v${v} flags=0x${flags.toString(16)}`
+        }
+        case 'mdhd': {
+          const v = versionOf(view, b)
+          const ts = mdhdTimescale(view, b)
+          const off = mdhdDurationOffset(view, b)
+          return `timescale=${ts} duration=${readUint(view, off.offset, off.bytes)} (${(readUint(view, off.offset, off.bytes) / ts).toFixed(3)}s) v${v}`
+        }
+        case 'hdlr':
+          return `handler=${hdlrKind(view, b)}`
+        case 'elst': {
+          const entries = readElst(view, b)
+          const total = entries.reduce((s, e) => s + e.segmentDuration, 0)
+          return `${entries.length} 个 entry, segment_duration 合计=${total}, 明细=[${entries.map(e => `${e.segmentDuration}@${e.mediaTime}`).join(', ')}]`
+        }
+        case 'stts': {
+          const entries = readStts(view, b)
+          const total = entries.reduce((s, e) => s + e.count * e.delta, 0)
+          return `${entries.length} 条, 合计=${total}, 明细=[${entries.map(e => `${e.count}x${e.delta}`).join(', ')}]`
+        }
+        case 'tfhd': {
+          const { trackId, defaultDuration } = readTfhd(view, b)
+          const flags = view.getUint32(b.dataStart) & 0xffffff
+          return `track_id=${trackId} flags=0x${flags.toString(16)} default_sample_duration=${defaultDuration?.value ?? '-'}`
+        }
+        case 'tfdt': {
+          const f = readTfdt(view, b)
+          return `baseMediaDecodeTime=${f.value}`
+        }
+        case 'trun': {
+          const t = readTrun(view, b)
+          const sum = t.durations.reduce((s, d) => s + d.value, 0)
+          const flags = view.getUint32(b.dataStart) & 0xffffff
+          let dataOffset = '-'
+          if (flags & 0x000001) dataOffset = String(view.getInt32(b.dataStart + 8))
+          return `flags=0x${flags.toString(16)} sample_count=${t.count} data_offset=${dataOffset} 有每样本时长=${t.durations.length} 合计=${sum}`
+        }
+        case 'trex': {
+          const trackId = view.getUint32(b.dataStart + 4)
+          const descIdx = view.getUint32(b.dataStart + 8)
+          const dur = view.getUint32(b.dataStart + 12)
+          const size = view.getUint32(b.dataStart + 16)
+          return `track_id=${trackId} default_sample_description_index=${descIdx} default_sample_duration=${dur} default_sample_size=${size}`
+        }
+        case 'stsd':
+          return `entries=${view.getUint32(b.dataStart + 4)}`
+        default:
+          return ''
+      }
+    } catch {
+      return '(解析出错)'
+    }
+  }
+
+  const walk = (b: Box, depth: number) => {
+    const indent = '  '.repeat(depth)
+    const info = describe(b)
+    lines.push(`${indent}${b.type} (${b.size} 字节)${info ? '  ' + info : ''}`)
+    if (b.type === 'mdat') return // 编码数据不打印
+    const children = readBoxes(view, b.dataStart, b.dataEnd)
+    for (const c of children) walk(c, depth + 1)
+  }
+
+  for (const b of readBoxes(view, 0, buffer.byteLength)) walk(b, 0)
+
+  return lines.join('\n')
 }

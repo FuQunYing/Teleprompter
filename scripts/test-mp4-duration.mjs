@@ -137,6 +137,28 @@ function readSttsDelta(bytes) {
   return found
 }
 
+/** 读回所有 elst 的 segment_duration 合计 */
+function readElstSegmentTotal(bytes) {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  let total = 0
+  const walk = (start, end) => {
+    let p = start
+    while (p + 8 <= end) {
+      const size = dv.getUint32(p)
+      const type = String.fromCharCode(...bytes.slice(p + 4, p + 8))
+      const dataStart = p + 8
+      if (type === 'elst') {
+        const count = dv.getUint32(dataStart + 4)
+        for (let i = 0; i < count; i++) total += dv.getUint32(dataStart + 8 + i * 12)
+      } else if (['moov', 'trak', 'edts'].includes(type)) walk(dataStart, p + size)
+      if (size < 8) break
+      p += size
+    }
+  }
+  walk(0, bytes.length)
+  return total
+}
+
 const now = 0xe5f00000
 const BAD = 73522000 // 垃圾时长：20:25:22
 
@@ -285,15 +307,29 @@ const tfdts6 = readTfdtValues(bytes6)
 check('tfdt 被按比例缩放', tfdts6[1], Math.round((1 * 30 * 3000) * (10 / 9)))
 check('mvhd.duration', readMvhd(bytes6).value, 10000)
 
-// ============ 场景七：webm / 垃圾输入不崩 ============
-console.log('\n--- 场景七：webm 与垃圾输入 ---')
+// ============ 场景七：编辑列表(elst)让呈现时长翻倍 ============
+console.log('\n--- 场景七：elst 的 segment_duration 是真实值的 2 倍 ---')
+const elst = box('elst', u32(0), u32(1), u32(20000), u32(0), u32(1), u32(0)) // segment_duration=20000(20s)
+const edts = box('edts', elst)
+const stts7 = box('stts', u32(0), u32(1), u32(300), u32(3000)) // 300 帧 × 3000 = 900000 → 10s
+const stbl7 = box('stbl', box('stsd', u32(0), u32(0)), stts7)
+const moov7 = box('moov', mvhd(0),
+  box('trak', tkhd(1, 0), edts, box('mdia', mdhd(90000, 0), hdlr('vide'), box('minf', stbl7))))
+const b7 = new Blob([concat([ftyp, moov7, mdat])], { type: 'video/mp4' })
+const r7 = await fixMp4Duration(b7, 10)
+const bytes7 = new Uint8Array(await r7.blob.arrayBuffer())
+check('elst 已缩放到 10s', readElstSegmentTotal(bytes7), 10000)
+check('mvhd.duration', readMvhd(bytes7).value, 10000)
+
+// ============ 场景八：webm / 垃圾输入不崩 ============
+console.log('\n--- 场景八：webm 与垃圾输入 ---')
 const webm = new Blob([new Uint8Array([0x1a, 0x45, 0xdf, 0xa3])], { type: 'video/webm' })
-const r7 = await fixMp4Duration(webm, 10)
-check('webm 未修改', r7.changed, false)
+const r8 = await fixMp4Duration(webm, 10)
+check('webm 未修改', r8.changed, false)
 
 const junk = new Blob([new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9])], { type: 'video/mp4' })
-const r8 = await fixMp4Duration(junk, 10)
-check('垃圾输入未崩溃', r7.changed, false)
+const r9 = await fixMp4Duration(junk, 10)
+check('垃圾输入未崩溃', r9.changed, false)
 
 console.log(failures === 0 ? '\n全部通过' : `\n${failures} 项失败`)
 process.exit(failures === 0 ? 0 : 1)

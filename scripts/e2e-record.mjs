@@ -160,6 +160,19 @@ try {
   const { writeFileSync } = await import('node:fs')
   writeFileSync('/tmp/teleprompter-e2e.mp4', Buffer.from(b64, 'base64'))
   console.log('已保存 /tmp/teleprompter-e2e.mp4')
+
+  // 顺便验证「上传到开发机」这条链路
+  const uploaded = await evaluate(`(async () => {
+    const blob = await (await fetch(document.querySelector('.result-video').src)).blob()
+    const name = 'e2e-test.mp4'
+    const nb = new TextEncoder().encode(name)
+    const header = new Uint8Array(4 + nb.length)
+    new DataView(header.buffer).setUint32(0, nb.length)
+    header.set(nb, 4)
+    const res = await fetch('/upload', { method: 'POST', body: new Blob([header, blob]) })
+    return res.status + ' ' + await res.text()
+  })()`)
+  console.log('上传测试:', uploaded)
 } finally {
   try { ws?.close() } catch {}
   chrome.kill()

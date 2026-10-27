@@ -6,4 +6,10 @@ import { defineConfig } from 'vite'
 export default defineConfig({
   plugins: [basicSsl(), vue()],
   base: '/Teleprompter/',
+  server: {
+    proxy: {
+      // 开发机上传接口：node scripts/upload-server.mjs
+      '/upload': 'http://localhost:5180',
+    },
+  },
 })

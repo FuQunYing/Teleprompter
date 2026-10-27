@@ -7,8 +7,10 @@
     "dev": "vite --host",
     "build": "vue-tsc -b && vite build",
     "preview": "vite preview",
-    "test:mp4": "node --experimental-strip-types scripts/test-mp4-duration.mjs",
-    "test:e2e": "node scripts/e2e-record.mjs"
+    "test:mp4": "node --experimental-strip-types scripts/test-mp4-duration.mjs && node --experimental-strip-types scripts/test-mp4-progressive.mjs",
+    "test:e2e": "node scripts/e2e-record.mjs",
+    "upload": "node scripts/upload-server.mjs",
+    "test:safari": "node scripts/probe-safari.mjs"
   },
   "dependencies": {
     "vue": "^3.5.42"

@@ -1,7 +1,8 @@
 
 <script setup lang="ts">
 import { ref, computed, onBeforeUnmount } from 'vue'
-import { fixMp4Duration } from './mp4Duration'
+import { fixMp4Duration, dumpMp4Structure } from './mp4Duration'
+import { toProgressiveMp4 } from './mp4Progressive'
 
 const script = ref('')
 const speed = ref(35) // 每秒滚动像素
@@ -17,9 +18,10 @@ const showSettings = ref(false)
 const recordingSeconds = ref(0)
 const resultDuration = ref(0) // 成片真实时长（秒）
 const durationNote = ref('')
+const dumpNote = ref('')
 
-const CANVAS_W = 720
-const CANVAS_H = 1280
+const CANVAS_W = 1080
+const CANVAS_H = 1920
 const TARGET_FPS = 30
 const FRAME_INTERVAL = 1000 / TARGET_FPS
 
@@ -237,20 +239,33 @@ async function startRecording() {
       // 实际录制时长（秒），用于容器时间戳不可信时兜底
       const elapsed = Math.max(0, (performance.now() - recordStartAt - pausedTotal) / 1000)
 
-      // Safari 的 mp4 时间轴（moof/tfdt/trun、stts）经常是坏的：
-      // 播放器按样本时间轴算时长，只改 moov 头部没有用。
-      // 这里重建分片时间轴、把各轨样本时长缩放到真实录制时长。
+      // 1) 修正容器时长：Safari 写出来的 mp4 里 mvhd/mdhd/tkhd 的 duration 是 0 或错的
       try {
         const fixed = await fixMp4Duration(blob, elapsed)
         blob = fixed.blob
         const stored = fixed.analysis.storedMovieDuration / fixed.analysis.movieTimescale
         const parts = [`录制 ${elapsed.toFixed(1)}s`]
-        parts.push(fixed.changed ? `容器已修正 → ${fixed.targetDuration.toFixed(1)}s` : '容器未改动')
+        parts.push(fixed.changed ? `容器时长已修正 → ${fixed.targetDuration.toFixed(1)}s` : '容器时长未改动')
         parts.push(`原始标注 ${stored.toFixed(1)}s`)
         if (fixed.report) parts.push(fixed.report)
         durationNote.value = parts.join(' ｜ ')
       } catch (e) {
         console.warn('修正 mp4 时长失败', e)
+      }
+
+      // 2) fragmented mp4 → progressive mp4。
+      //    WebKit（Safari / iOS Safari）对 fragmented mp4 的时长计算会把音视频两条轨
+      //    相加，导致时长翻倍（10.5 秒的片子显示成 21 秒），进度条和剪辑都错。
+      //    转成 progressive 后走标准的 stts/stsz 路径，时长才正确。
+      try {
+        const prog = await toProgressiveMp4(blob)
+        if (prog.changed) {
+          blob = prog.blob
+          const detail = prog.tracks.map(t => `${t.kind} ${t.samples}帧 ${t.duration.toFixed(1)}s`).join(' / ')
+          durationNote.value = `${durationNote.value} ｜ 已转为标准 mp4（${detail}）`
+        }
+      } catch (e) {
+        console.warn('转换 mp4 失败', e)
       }
 
       if (videoUrl.value) URL.revokeObjectURL(videoUrl.value)
@@ -264,6 +279,11 @@ async function startRecording() {
 
       const probed = await probeDuration(videoUrl.value)
       resultDuration.value = Number.isFinite(probed) ? probed : 0
+      try {
+        dumpNote.value = await dumpMp4Structure(blob)
+      } catch (e) {
+        console.warn('导出 mp4 结构失败', e)
+      }
       if (resultDuration.value > 0) {
         durationNote.value = durationNote.value
           ? `${durationNote.value} · 成片时长 ${resultDuration.value.toFixed(1)} 秒`
@@ -398,6 +418,40 @@ function closeSettings() {
   showSettings.value = false
 }
 
+async function copyDiagnostics() {
+  const text = [
+    durationNote.value,
+    '',
+    '--- mp4 结构 ---',
+    dumpNote.value,
+  ].join('\n')
+
+  try {
+    await navigator.clipboard.writeText(text)
+    error.value = '诊断信息已复制到剪贴板'
+  } catch {
+    error.value = '复制失败，请手动截图上面的诊断行'
+  }
+}
+
+async function uploadToDev() {
+  if (!videoUrl.value) return
+  try {
+    const blob = await (await fetch(videoUrl.value)).blob()
+    const name = `teleprompter-${Date.now()}.${blob.type.includes('mp4') ? 'mp4' : 'webm'}`
+    const nameBytes = new TextEncoder().encode(name)
+    const header = new Uint8Array(4 + nameBytes.length)
+    new DataView(header.buffer).setUint32(0, nameBytes.length)
+    header.set(nameBytes, 4)
+    const body = new Blob([header, blob])
+    const res = await fetch('/upload', { method: 'POST', body })
+    const text = await res.text()
+    error.value = res.ok ? `已上传：${text}` : `上传失败：${text}`
+  } catch (e) {
+    error.value = `上传失败：${e instanceof Error ? e.message : e}`
+  }
+}
+
 async function saveVideo() {
   if (!videoUrl.value) return
 
@@ -448,7 +502,7 @@ onBeforeUnmount(() => {
       <div class="prompt" ref="promptEl">
         <p>{{ script || '请在下方输入你的台词' }}</p>
       </div>
-      <span v-if="recording" class="rec">● REC {{ recordingSeconds }} 秒</span>
+        <span v-if="recording" class="rec">● REC {{ recordingSeconds }} 秒</span>
     </section>
 
     <p v-if="error" class="error">{{ error }}</p>
@@ -529,6 +583,8 @@ onBeforeUnmount(() => {
     <section v-if="videoUrl" class="result">
       <h2>录制完成</h2>
       <p v-if="durationNote" class="duration-note">{{ durationNote }}</p>
+<!--      <button class="ghost" @click="copyDiagnostics">复制诊断信息</button>-->
+<!--      <button class="ghost" @click="uploadToDev">上传到开发机（排查用）</button>-->
       <video :src="videoUrl" controls playsinline class="result-video" />
       <button @click="saveVideo">导出 / 保存视频</button>
     </section>
