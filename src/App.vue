@@ -418,39 +418,39 @@ function closeSettings() {
   showSettings.value = false
 }
 
-async function copyDiagnostics() {
-  const text = [
-    durationNote.value,
-    '',
-    '--- mp4 结构 ---',
-    dumpNote.value,
-  ].join('\n')
-
-  try {
-    await navigator.clipboard.writeText(text)
-    error.value = '诊断信息已复制到剪贴板'
-  } catch {
-    error.value = '复制失败，请手动截图上面的诊断行'
-  }
-}
-
-async function uploadToDev() {
-  if (!videoUrl.value) return
-  try {
-    const blob = await (await fetch(videoUrl.value)).blob()
-    const name = `teleprompter-${Date.now()}.${blob.type.includes('mp4') ? 'mp4' : 'webm'}`
-    const nameBytes = new TextEncoder().encode(name)
-    const header = new Uint8Array(4 + nameBytes.length)
-    new DataView(header.buffer).setUint32(0, nameBytes.length)
-    header.set(nameBytes, 4)
-    const body = new Blob([header, blob])
-    const res = await fetch('/upload', { method: 'POST', body })
-    const text = await res.text()
-    error.value = res.ok ? `已上传：${text}` : `上传失败：${text}`
-  } catch (e) {
-    error.value = `上传失败：${e instanceof Error ? e.message : e}`
-  }
-}
+// async function copyDiagnostics() {
+//   const text = [
+//     durationNote.value,
+//     '',
+//     '--- mp4 结构 ---',
+//     dumpNote.value,
+//   ].join('\n')
+//
+//   try {
+//     await navigator.clipboard.writeText(text)
+//     error.value = '诊断信息已复制到剪贴板'
+//   } catch {
+//     error.value = '复制失败，请手动截图上面的诊断行'
+//   }
+// }
+//
+// async function uploadToDev() {
+//   if (!videoUrl.value) return
+//   try {
+//     const blob = await (await fetch(videoUrl.value)).blob()
+//     const name = `teleprompter-${Date.now()}.${blob.type.includes('mp4') ? 'mp4' : 'webm'}`
+//     const nameBytes = new TextEncoder().encode(name)
+//     const header = new Uint8Array(4 + nameBytes.length)
+//     new DataView(header.buffer).setUint32(0, nameBytes.length)
+//     header.set(nameBytes, 4)
+//     const body = new Blob([header, blob])
+//     const res = await fetch('/upload', { method: 'POST', body })
+//     const text = await res.text()
+//     error.value = res.ok ? `已上传：${text}` : `上传失败：${text}`
+//   } catch (e) {
+//     error.value = `上传失败：${e instanceof Error ? e.message : e}`
+//   }
+// }
 
 async function saveVideo() {
   if (!videoUrl.value) return
