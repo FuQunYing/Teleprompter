@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite --host",
     "build": "vue-tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:mp4": "node --experimental-strip-types scripts/test-mp4-duration.mjs",
+    "test:e2e": "node scripts/e2e-record.mjs"
   },
   "dependencies": {
     "vue": "^3.5.42"

@@ -156,6 +156,12 @@ button:disabled {
   background: #111;
 }
 
+.duration-note {
+  margin: 0 0 10px;
+  color: #666;
+  font-size: 13px;
+}
+
 /* Floating settings button */
 .fab {
   position: fixed;
