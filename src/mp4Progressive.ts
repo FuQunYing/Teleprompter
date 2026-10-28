@@ -8,13 +8,19 @@
  * 软件里全是错的（AVFoundation / Chrome 的 demuxer 是对的）。
  *
  * 转成 progressive mp4 后，播放器走 stts/stsz 这条标准路径，时长就正确了。
- * 转换本身不改动任何编码数据：只是把样本表从分片搬到 moov，mdat 里仍是原来的字节。
+ * 转换不改编码数据，只重写容器，让剪辑软件能随机取帧：
+ * - 按码流里的 IDR 写关键帧表（stss）。没有这张表时，剪映会把 P 帧当关键帧解，时间轴是黑的。
+ * - 视频帧时长收成固定间隔，并尽量和音轨对齐。Safari 写出来的是可变帧率。
+ * - ftyp 改成普通 mp4，去掉 hlsf（分片直播）标记。
+ * - 轨标志标成「在成片里」，mvhd/tkhd/mdhd 的时长改成样本时长之和。
  */
 
 export interface ProgressiveTrack {
   kind: string
   samples: number
   duration: number // 秒
+  /** 视频轨里扫出来的关键帧数。音频轨没有这个字段。 */
+  syncSamples?: number
 }
 
 export interface ProgressiveResult {
@@ -77,9 +83,147 @@ function makeBox(type: string, ...payloads: Uint8Array[]): Uint8Array {
   return concat([head, body])
 }
 
+/** 普通渐进式 mp4，不带 hlsf / iso5 这类分片品牌。 */
+function makeFtyp(): Uint8Array {
+  const enc = new TextEncoder()
+  return makeBox(
+    'ftyp',
+    enc.encode('isom'),
+    u32(0x200),
+    enc.encode('isom'),
+    enc.encode('iso2'),
+    enc.encode('avc1'),
+    enc.encode('mp41'),
+  )
+}
+
+function writeUint(dv: DataView, offset: number, bytes: 4 | 8, value: number) {
+  const v = Math.max(0, Math.round(value))
+  if (bytes === 8) dv.setBigUint64(offset, BigInt(Math.min(v, Number.MAX_SAFE_INTEGER)))
+  else if (v <= 0xffffffff) dv.setUint32(offset, v)
+}
+
+/** 打开 track_enabled | track_in_movie | track_in_preview，并写上影片时基下的时长。 */
+function finishTkhd(box: Uint8Array, movieDuration: number): Uint8Array {
+  const out = box.slice()
+  const dv = new DataView(out.buffer, out.byteOffset, out.byteLength)
+  const version = out[8]
+  const raw = dv.getUint32(8)
+  dv.setUint32(8, (raw & 0xff000000) | ((raw | 0x7) & 0x00ffffff))
+  const wide = version === 1
+  writeUint(dv, 8 + (wide ? 28 : 20), wide ? 8 : 4, movieDuration)
+  return out
+}
+
+/** mvhd / mdhd 的 duration 字段位置相同。 */
+function finishDuration(box: Uint8Array, duration: number): Uint8Array {
+  const out = box.slice()
+  const dv = new DataView(out.buffer, out.byteOffset, out.byteLength)
+  const wide = out[8] === 1
+  writeUint(dv, 8 + (wide ? 24 : 16), wide ? 8 : 4, duration)
+  return out
+}
+
+function readTrexDefaults(view: DataView, moovChildren: Box[]): Map<number, TrexDefault> {
+  const out = new Map<number, TrexDefault>()
+  const mvex = moovChildren.find(b => b.type === 'mvex')
+  if (!mvex) return out
+  for (const trex of readBoxes(view, mvex.dataStart, mvex.start + mvex.size).filter(b => b.type === 'trex')) {
+    out.set(view.getUint32(trex.dataStart + 4), {
+      duration: view.getUint32(trex.dataStart + 12),
+      size: view.getUint32(trex.dataStart + 16),
+      flags: view.getUint32(trex.dataStart + 20),
+    })
+  }
+  return out
+}
+
+function avcNalLengthSize(stsd: Box | null, view: DataView, bytes: Uint8Array): number | null {
+  if (!stsd) return null
+  const entryCount = view.getUint32(stsd.dataStart + 4)
+  let p = stsd.dataStart + 8
+  const end = stsd.start + stsd.size
+  for (let i = 0; i < entryCount && p + 8 <= end; i++) {
+    const size = view.getUint32(p)
+    if (size < 8 || p + size > end) break
+    const type = FOURCC(view, p + 4)
+    if (type === 'avc1' || type === 'avc3') {
+      const children = readBoxes(view, p + 8 + 78, p + size)
+      const avcC = children.find(b => b.type === 'avcC')
+      if (avcC && avcC.start + avcC.size >= avcC.dataStart + 5) {
+        return (bytes[avcC.dataStart + 4] & 3) + 1
+      }
+      return 4
+    }
+    p += size
+  }
+  return null
+}
+
+/** 样本能按长度前缀拆完、且含 IDR（NAL type 5）时返回 true/false，拆不开返回 null。 */
+function sampleHasIdr(data: Uint8Array, nalLen: number): boolean | null {
+  if (nalLen < 1 || nalLen > 4 || data.length < nalLen + 1) return null
+  let r = 0
+  let idr = false
+  while (r + nalLen <= data.length) {
+    let len = 0
+    for (let i = 0; i < nalLen; i++) len = (len << 8) | data[r + i]
+    if (len < 1 || r + nalLen + len > data.length) return null
+    if ((data[r + nalLen] & 0x1f) === 5) idr = true
+    r += nalLen + len
+  }
+  return r === data.length ? idr : null
+}
+
+function markVideoSync(track: TrackInfo, view: DataView, bytes: Uint8Array) {
+  const nalLen = avcNalLengthSize(track.stsd, view, bytes) ?? 4
+  const idr: (boolean | null)[] = track.samples.map(s => sampleHasIdr(s.data, nalLen))
+  const parsed = idr.filter(v => v !== null).length
+  const idrCount = idr.filter(v => v === true).length
+  if (parsed === track.samples.length && idrCount > 0) {
+    track.samples.forEach((s, i) => { s.sync = idr[i] === true })
+  }
+  if (!track.samples.some(s => s.sync) && track.samples.length) track.samples[0].sync = true
+}
+
+/**
+ * 可变帧率收成「除最后一帧外时长完全相同」。
+ * 和音轨相差在 5% 以内时，总时长跟音轨走，避免剪辑软件里音画两条线对不齐。
+ */
+function flattenVideoTiming(tracks: TrackInfo[]) {
+  const video = tracks.find(t => t.kind === 'vide')
+  if (!video || video.samples.length < 2 || video.timescale <= 0) return
+  const first = video.samples[0].duration
+  if (video.samples.every(s => s.duration === first)) return
+
+  let total = video.samples.reduce((sum, s) => sum + s.duration, 0)
+  const audio = tracks.find(t => t.kind === 'soun' && t.samples.length > 0 && t.timescale > 0)
+  if (audio) {
+    const audioSec = audio.samples.reduce((sum, s) => sum + s.duration, 0) / audio.timescale
+    const videoSec = total / video.timescale
+    if (audioSec > 0.05 && Math.abs(audioSec - videoSec) / audioSec <= 0.05) {
+      total = Math.max(video.samples.length, Math.round(audioSec * video.timescale))
+    }
+  }
+  const base = Math.floor(total / video.samples.length)
+  if (base <= 0) return
+  const rem = total - base * video.samples.length
+  video.samples.forEach((s, i) => {
+    s.duration = i === video.samples.length - 1 ? base + rem : base
+  })
+}
+
 interface Sample {
   duration: number
   data: Uint8Array
+  /** 来自分片标志。视频轨随后会按 IDR 改写。 */
+  sync: boolean
+}
+
+interface TrexDefault {
+  duration: number
+  size: number
+  flags: number
 }
 
 interface TrackInfo {
@@ -121,6 +265,9 @@ export async function toProgressiveMp4(input: Blob): Promise<ProgressiveResult> 
   const moovChildren = readBoxes(view, moovBox.dataStart, moovBox.start + moovBox.size)
   const mvhd = moovChildren.find(b => b.type === 'mvhd')
   if (!mvhd) return empty
+  const mvhdVersion = view.getUint8(mvhd.dataStart)
+  const movieTimescale = view.getUint32(mvhd.dataStart + (mvhdVersion === 1 ? 20 : 12)) || 1000
+  const trexDefaults = readTrexDefaults(view, moovChildren)
 
   const tracks = new Map<number, TrackInfo>()
   for (const trak of moovChildren.filter(b => b.type === 'trak')) {
@@ -161,6 +308,7 @@ export async function toProgressiveMp4(input: Blob): Promise<ProgressiveResult> 
       if (!tfhd) continue
       const flags = view.getUint32(tfhd.dataStart) & 0xffffff
       const trackId = view.getUint32(tfhd.dataStart + 4)
+      const trex = trexDefaults.get(trackId)
       let p = tfhd.dataStart + 8
       let baseDataOffset: number | null = null
       if (flags & 0x000001) {
@@ -168,13 +316,22 @@ export async function toProgressiveMp4(input: Blob): Promise<ProgressiveResult> 
         p += 8
       }
       if (flags & 0x000002) p += 4
-      let defaultDuration = 0
+      let defaultDuration = trex?.duration ?? 0
       if (flags & 0x000008) {
         defaultDuration = view.getUint32(p)
         p += 4
       }
-      if (flags & 0x000010) p += 4
-      if (flags & 0x000020) p += 4
+      let defaultSize = trex?.size ?? 0
+      if (flags & 0x000010) {
+        defaultSize = view.getUint32(p)
+        p += 4
+      }
+      // 0x00010000 = sample_is_non_sync_sample。Safari 的默认值经常把非首帧都标成非关键帧。
+      let defaultFlags = trex?.flags ?? 0
+      if (flags & 0x000020) {
+        defaultFlags = view.getUint32(p)
+        p += 4
+      }
       const base = baseDataOffset ?? moof.start
       const track = tracks.get(trackId)
       if (!track) continue
@@ -188,7 +345,11 @@ export async function toProgressiveMp4(input: Blob): Promise<ProgressiveResult> 
           dataOffset = view.getInt32(q)
           q += 4
         }
-        if (f & 0x000004) q += 4
+        let firstFlags: number | null = null
+        if (f & 0x000004) {
+          firstFlags = view.getUint32(q)
+          q += 4
+        }
         let off = base + (dataOffset ?? 0)
         for (let i = 0; i < count; i++) {
           let duration: number | undefined
@@ -201,12 +362,21 @@ export async function toProgressiveMp4(input: Blob): Promise<ProgressiveResult> 
             size = view.getUint32(q)
             q += 4
           }
-          if (f & 0x000400) q += 4
+          let sampleFlags = defaultFlags
+          if (f & 0x000400) {
+            sampleFlags = view.getUint32(q)
+            q += 4
+          } else if (i === 0 && firstFlags !== null) {
+            sampleFlags = firstFlags
+          }
           if (f & 0x000800) q += 4
-          const finalSize = size ?? 0
+          const finalSize = size ?? defaultSize
+          const start = off < 0 ? 0 : off
+          const end = Math.min(bytes.length, start + Math.max(0, finalSize))
           track.samples.push({
             duration: duration ?? defaultDuration,
-            data: bytes.subarray(off, off + finalSize),
+            data: bytes.subarray(start, end),
+            sync: (sampleFlags & 0x00010000) === 0,
           })
           off += finalSize
         }
@@ -216,6 +386,19 @@ export async function toProgressiveMp4(input: Blob): Promise<ProgressiveResult> 
 
   const used = [...tracks.values()].filter(t => t.samples.length > 0)
   if (!used.length) return empty
+
+  flattenVideoTiming(used)
+  for (const t of used) {
+    if (t.kind === 'vide') markVideoSync(t, view, bytes)
+    else t.samples.forEach(s => { s.sync = true })
+  }
+
+  const mediaDuration = (t: TrackInfo) => t.samples.reduce((sum, s) => sum + s.duration, 0)
+  const movieDurationOf = (t: TrackInfo) => {
+    if (t.timescale <= 0) return 0
+    return Math.round(mediaDuration(t) / t.timescale * movieTimescale)
+  }
+  const movieDuration = used.reduce((max, t) => Math.max(max, movieDurationOf(t)), 0)
 
   // ---- 组装 mdat：每条轨的数据连续排布 ----
   // 注意：不把样本数据拼成一个大数组（那样会多占一份内存），
@@ -248,6 +431,13 @@ export async function toProgressiveMp4(input: Blob): Promise<ProgressiveResult> 
         u32(runs.length),
         ...runs.map(r => concat([u32(r.count), u32(r.delta)])),
       )
+      // 全部都是关键帧时按规范不写 stss。有 P 帧才列出 IDR 的样本序号（从 1 开始）。
+      const syncNums = t.samples.every(s => s.sync)
+        ? []
+        : t.samples.flatMap((s, i) => s.sync ? [i + 1] : [])
+      const stss = syncNums.length
+        ? makeBox('stss', u32(0), u32(syncNums.length), ...syncNums.map(n => u32(n)))
+        : null
       const stsz = makeBox(
         'stsz',
         u32(0),
@@ -261,7 +451,9 @@ export async function toProgressiveMp4(input: Blob): Promise<ProgressiveResult> 
 
       const stblParts: Uint8Array[] = []
       if (t.stsd) stblParts.push(slice(t.stsd))
-      stblParts.push(stts, stsc, stsz, stco)
+      stblParts.push(stts)
+      if (stss) stblParts.push(stss)
+      stblParts.push(stsc, stsz, stco)
       const stbl = makeBox('stbl', ...stblParts)
 
       const minfParts: Uint8Array[] = []
@@ -275,20 +467,21 @@ export async function toProgressiveMp4(input: Blob): Promise<ProgressiveResult> 
       const mdiaParts: Uint8Array[] = []
       for (const k of readBoxes(view, t.mdia.dataStart, t.mdia.start + t.mdia.size)) {
         if (k.type === 'minf') mdiaParts.push(newMinf)
+        else if (k.type === 'mdhd') mdiaParts.push(finishDuration(slice(k), mediaDuration(t)))
         else mdiaParts.push(slice(k))
       }
       const newMdia = makeBox('mdia', ...mdiaParts)
 
-      parts.push(makeBox('trak', slice(t.tkhd), newMdia))
+      parts.push(makeBox('trak', finishTkhd(slice(t.tkhd), movieDurationOf(t)), newMdia))
     }
-    // mvhd 原样保留（时长已在前面修好），不放 mvex —— progressive 文件没有 mvex
-    return makeBox('moov', slice(mvhd), ...parts)
+    // 不放 mvex —— progressive 文件没有分片
+    return makeBox('moov', finishDuration(slice(mvhd), movieDuration), ...parts)
   }
 
-  const ftyp = top.find(b => b.type === 'ftyp')
+  const ftyp = makeFtyp()
   let moov = buildMoov(0)
   // chunk 偏移是相对文件的绝对位置，需要加上 moov 之后的位置
-  moov = buildMoov((ftyp?.size ?? 0) + moov.length + 8)
+  moov = buildMoov(ftyp.length + moov.length + 8)
 
   // 用一个大头 + 各个分片直接构造 Blob，避免再复制一份完整数据
   const mdatBoxHeader = new Uint8Array(8)
@@ -296,7 +489,7 @@ export async function toProgressiveMp4(input: Blob): Promise<ProgressiveResult> 
   mdatBoxHeader.set(new TextEncoder().encode('mdat'), 4)
 
   const parts: BlobPart[] = []
-  if (ftyp) parts.push(slice(ftyp) as BlobPart)
+  parts.push(ftyp as BlobPart)
   parts.push(moov as BlobPart)
   parts.push(mdatBoxHeader as BlobPart)
   for (const c of mdatChunks) parts.push(c as BlobPart)
@@ -308,6 +501,7 @@ export async function toProgressiveMp4(input: Blob): Promise<ProgressiveResult> 
       kind: t.kind,
       samples: t.samples.length,
       duration: t.samples.reduce((a, s) => a + s.duration, 0) / (t.timescale || 1),
+      syncSamples: t.kind === 'vide' ? t.samples.filter(s => s.sync).length : undefined,
     })),
   }
 }

@@ -109,6 +109,59 @@ const mdatBox = boxes(bytes, 0, bytes.length).find(b => b.type === 'mdat')
 console.log('    调试: stco=', chunkOffset, 'mdat.start=', mdatBox.start, 'mdat.size=', mdatBox.size)
 check('stco 指向 mdat 内', chunkOffset >= mdatBox.start + 8 && chunkOffset < mdatBox.start + mdatBox.size, true)
 
+// 剪映会随机取帧：可变帧率要收平，IDR 要写进 stss，hlsf 品牌要去掉。
+console.log('\n--- 可变帧率 + 关键帧表 + 去掉 hlsf ---')
+const idr = concat([u32(1), Uint8Array.of(0x65)])
+const pframe = concat([u32(1), Uint8Array.of(0x41)])
+const frames = [
+  { dur: 10, data: idr },
+  { dur: 40, data: pframe },
+  { dur: 15, data: idr },
+]
+const videoTrunOf = (dataOffset) => box(
+  'trun', u32(0x000301), u32(frames.length), u32(dataOffset),
+  ...frames.flatMap(f => [u32(f.dur), u32(f.data.length)]),
+)
+// 默认标志把所有帧标成非关键帧。转换必须自己从码流里认出 IDR，不能信这个标志。
+const tfhdNonSync = box('tfhd', u32(0x000028), u32(2), u32(10), u32(0x00010000))
+const moofDraft = box('moof', box('mfhd', u32(0), u32(1)), box('traf', tfhdNonSync, tfdt, videoTrunOf(0)))
+const moofEditor = box('moof', box('mfhd', u32(0), u32(1)), box('traf', tfhdNonSync, tfdt, videoTrunOf(moofDraft.length + 8)))
+const ftypHls = box('ftyp', enc.encode('iso5'), u32(1), enc.encode('isomiso5hlsf'))
+const moovVideo = box('moov', mvhd, trak(2, 'vide', 600), box('mvex', trex(2)))
+const mdatFrames = box('mdat', ...frames.map(f => f.data))
+const editorSrc = new Blob([concat([ftypHls, moovVideo, moofEditor, mdatFrames])], { type: 'video/mp4' })
+const editor = await toProgressiveMp4(editorSrc)
+check('剪辑向转换发生了', editor.changed, true)
+check('视频关键帧数', editor.syncSamples ?? editor.tracks[0].syncSamples, 2)
+check('收平后的时长(s)', Number(editor.tracks[0].duration.toFixed(4)), 0.1083)
+
+const editorBytes = new Uint8Array(await editor.blob.arrayBuffer())
+const editorDv = new DataView(editorBytes.buffer, editorBytes.byteOffset, editorBytes.byteLength)
+const editorTop = boxes(editorBytes, 0, editorBytes.length)
+const editorFtyp = editorTop.find(b => b.type === 'ftyp')
+const brandBytes = editorBytes.slice(editorFtyp.dataStart, editorFtyp.start + editorFtyp.size)
+const brandText = String.fromCharCode(...brandBytes)
+check('ftyp 不再是 hlsf', brandText.includes('hlsf'), false)
+check('ftyp 主品牌 isom', String.fromCharCode(...editorBytes.slice(editorFtyp.dataStart, editorFtyp.dataStart + 4)), 'isom')
+
+const editorMoov = editorTop.find(b => b.type === 'moov')
+const editorTrak = boxes(editorBytes, editorMoov.dataStart, editorMoov.start + editorMoov.size).find(b => b.type === 'trak')
+const editorMdia = boxes(editorBytes, editorTrak.dataStart, editorTrak.start + editorTrak.size).find(b => b.type === 'mdia')
+const editorMinf = boxes(editorBytes, editorMdia.dataStart, editorMdia.start + editorMdia.size).find(b => b.type === 'minf')
+const editorStbl = boxes(editorBytes, editorMinf.dataStart, editorMinf.start + editorMinf.size).find(b => b.type === 'stbl')
+const editorTables = boxes(editorBytes, editorStbl.dataStart, editorStbl.start + editorStbl.size)
+check('视频 stbl', editorTables.map(b => b.type).join(' '), 'stsd stts stss stsc stsz stco')
+const editorStss = editorTables.find(b => b.type === 'stss')
+check('stss 条数', editorDv.getUint32(editorStss.dataStart + 4), 2)
+check('第 1 个关键帧', editorDv.getUint32(editorStss.dataStart + 8), 1)
+check('第 2 个关键帧', editorDv.getUint32(editorStss.dataStart + 12), 3)
+const editorStts = editorTables.find(b => b.type === 'stts')
+check('收平后 stts 只有两种时长', editorDv.getUint32(editorStts.dataStart + 4), 2)
+check('前两帧时长', editorDv.getUint32(editorStts.dataStart + 12), 21)
+check('末帧补上余数', editorDv.getUint32(editorStts.dataStart + 20), 23)
+const editorTkhd = boxes(editorBytes, editorTrak.dataStart, editorTrak.start + editorTrak.size).find(b => b.type === 'tkhd')
+check('轨在成片中', editorDv.getUint32(editorTkhd.dataStart) & 0x7, 7)
+
 // 已经是 progressive 的输入应原样返回
 console.log('\n--- 幂等：progressive 输入不再转换 ---')
 const again = await toProgressiveMp4(result.blob)

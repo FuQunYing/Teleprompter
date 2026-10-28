@@ -261,7 +261,10 @@ async function startRecording() {
         const prog = await toProgressiveMp4(blob)
         if (prog.changed) {
           blob = prog.blob
-          const detail = prog.tracks.map(t => `${t.kind} ${t.samples}帧 ${t.duration.toFixed(1)}s`).join(' / ')
+          const detail = prog.tracks.map(t => {
+            const keys = t.kind === 'vide' && t.syncSamples ? ` ${t.syncSamples}个关键帧` : ''
+            return `${t.kind} ${t.samples}帧${keys} ${t.duration.toFixed(1)}s`
+          }).join(' / ')
           durationNote.value = `${durationNote.value} ｜ 已转为标准 mp4（${detail}）`
         }
       } catch (e) {
