@@ -10,7 +10,7 @@
  * 转成 progressive mp4 后，播放器走 stts/stsz 这条标准路径，时长就正确了。
  * 转换不改编码数据，只重写容器，让剪辑软件能随机取帧：
  * - 按码流里的 IDR 写关键帧表（stss）。没有这张表时，剪映会把 P 帧当关键帧解，时间轴是黑的。
- * - 视频帧时长收成固定间隔，并尽量和音轨对齐。Safari 写出来的是可变帧率。
+ * - 帧时长保持原样：iOS 网页录像是可变帧率，每帧时长就是它的采集时间，改成等长会音画不同步。
  * - ftyp 改成普通 mp4，去掉 hlsf（分片直播）标记。
  * - 轨标志标成「在成片里」，mvhd/tkhd/mdhd 的时长改成样本时长之和。
  */
@@ -184,33 +184,6 @@ function markVideoSync(track: TrackInfo, view: DataView, bytes: Uint8Array) {
     track.samples.forEach((s, i) => { s.sync = idr[i] === true })
   }
   if (!track.samples.some(s => s.sync) && track.samples.length) track.samples[0].sync = true
-}
-
-/**
- * 可变帧率收成「除最后一帧外时长完全相同」。
- * 和音轨相差在 5% 以内时，总时长跟音轨走，避免剪辑软件里音画两条线对不齐。
- */
-function flattenVideoTiming(tracks: TrackInfo[]) {
-  const video = tracks.find(t => t.kind === 'vide')
-  if (!video || video.samples.length < 2 || video.timescale <= 0) return
-  const first = video.samples[0].duration
-  if (video.samples.every(s => s.duration === first)) return
-
-  let total = video.samples.reduce((sum, s) => sum + s.duration, 0)
-  const audio = tracks.find(t => t.kind === 'soun' && t.samples.length > 0 && t.timescale > 0)
-  if (audio) {
-    const audioSec = audio.samples.reduce((sum, s) => sum + s.duration, 0) / audio.timescale
-    const videoSec = total / video.timescale
-    if (audioSec > 0.05 && Math.abs(audioSec - videoSec) / audioSec <= 0.05) {
-      total = Math.max(video.samples.length, Math.round(audioSec * video.timescale))
-    }
-  }
-  const base = Math.floor(total / video.samples.length)
-  if (base <= 0) return
-  const rem = total - base * video.samples.length
-  video.samples.forEach((s, i) => {
-    s.duration = i === video.samples.length - 1 ? base + rem : base
-  })
 }
 
 interface Sample {
@@ -387,7 +360,6 @@ export async function toProgressiveMp4(input: Blob): Promise<ProgressiveResult> 
   const used = [...tracks.values()].filter(t => t.samples.length > 0)
   if (!used.length) return empty
 
-  flattenVideoTiming(used)
   for (const t of used) {
     if (t.kind === 'vide') markVideoSync(t, view, bytes)
     else t.samples.forEach(s => { s.sync = true })
