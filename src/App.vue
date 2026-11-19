@@ -20,19 +20,12 @@ const resultDuration = ref(0) // 成片真实时长（秒）
 const durationNote = ref('')
 const dumpNote = ref('')
 
-const CANVAS_W = 1080
-const CANVAS_H = 1920
-const TARGET_FPS = 30
-const FRAME_INTERVAL = 1000 / TARGET_FPS
+const VIDEO_BITRATE = 6_000_000
 
 let stream: MediaStream | null = null
 let recorder: MediaRecorder | null = null
-let canvasStream: MediaStream | null = null
-let canvasCtx: CanvasRenderingContext2D | null = null
 let rafId = 0
-let drawRafId = 0
 let lastTime = 0
-let lastFrameAt = 0
 let scrollOffset = 0
 let recordingTimerId = 0
 let recordStartAt = 0
@@ -46,13 +39,11 @@ async function openCamera() {
   error.value = ''
 
   try {
-    // Lock to portrait so iOS Safari has a chance of returning a portrait
-    // MediaStream. Webkit doesn't honor this reliably, but it's worth a try.
     if (screen.orientation?.lock) {
       try {
         await screen.orientation.lock('portrait')
       } catch {
-        // user denied or unsupported — fall through to landscape stream + canvas
+        // iOS Safari 非全屏下可能拒绝锁定，忽略即可
       }
     }
 
@@ -64,8 +55,9 @@ async function openCamera() {
       audio: true,
       video: {
         facingMode: 'user',
-        width: { ideal: 1920 },
-        height: { ideal: 1080 },
+        width: { ideal: 1080 },
+        height: { ideal: 1920 },
+        aspectRatio: { ideal: 9 / 16 },
         frameRate: { ideal: 30, max: 30 },
       }
     })
@@ -115,51 +107,26 @@ function startScroll() {
   rafId = requestAnimationFrame(animateScroll)
 }
 
-function drawFrame() {
-  const video = videoEl.value
-  if (!video) return
+function createRecorder(mediaStream: MediaStream): MediaRecorder {
+  const mimeType = [
+    'video/mp4;codecs="avc1.42E028,mp4a.40.2"',
+    'video/mp4',
+    'video/webm;codecs=vp8,opus',
+    'video/webm',
+  ].find(type => MediaRecorder.isTypeSupported(type))
 
-  const ctx = canvasCtx
-  if (!ctx) return
-
-  const vw = video.videoWidth || 1920
-  const vh = video.videoHeight || 1080
-
-  ctx.fillStyle = '#000'
-  ctx.fillRect(0, 0, CANVAS_W, CANVAS_H)
-
-  // Fit (letterbox): scale to fit canvas without cropping.
-  const scale = Math.min(CANVAS_W / vw, CANVAS_H / vh)
-  const dw = vw * scale
-  const dh = vh * scale
-
-  ctx.save()
-  ctx.translate(CANVAS_W / 2, CANVAS_H / 2)
-  ctx.scale(-1, 1)
-  ctx.drawImage(video, -dw / 2, -dh / 2, dw, dh)
-  ctx.restore()
-}
-
-function startDrawLoop() {
-  if (drawRafId) cancelAnimationFrame(drawRafId)
-  lastFrameAt = 0
-
-  const draw = (now: number) => {
-    if (!recording.value) {
-      drawRafId = 0
-      return
-    }
-    drawRafId = requestAnimationFrame(draw)
-
-    if (paused.value) return
-    // 固定帧率：按 TARGET_FPS 节流，避免产出 VFR（可变帧率）视频
-    if (now - lastFrameAt < FRAME_INTERVAL) return
-    lastFrameAt = now
-
-    drawFrame()
+  try {
+    return new MediaRecorder(
+      mediaStream,
+      mimeType
+        ? { mimeType, videoBitsPerSecond: VIDEO_BITRATE }
+        : { videoBitsPerSecond: VIDEO_BITRATE },
+    )
+  } catch {
+    return mimeType
+      ? new MediaRecorder(mediaStream, { mimeType })
+      : new MediaRecorder(mediaStream)
   }
-
-  drawRafId = requestAnimationFrame(draw)
 }
 
 async function startRecording() {
@@ -178,37 +145,13 @@ async function startRecording() {
     return
   }
 
-  const video = videoEl.value
-  if (!video) return
-
   error.value = ''
   durationNote.value = ''
 
-  const canvas = document.createElement('canvas')
-  canvas.width = CANVAS_W
-  canvas.height = CANVAS_H
-  canvasCtx = canvas.getContext('2d')
-
   try {
-    // 固定帧率采集（不要用 captureStream(0)+requestFrame：
-    // iOS Safari 上 requestFrame 不可靠，会只录到一两帧）
-    canvasStream = canvas.captureStream(TARGET_FPS)
-
-    // 直接用麦克风原始音轨（不要绕 AudioContext：
-    // 重新生成的音轨时间戳基准不同，会让 mp4 音轨时间轴错乱）
-    const audioTrack = stream.getAudioTracks()[0]
-    if (audioTrack) canvasStream.addTrack(audioTrack)
-
-    const mimeType = [
-      'video/mp4;codecs="avc1.42E028,mp4a.40.2"',
-      'video/mp4',
-      'video/webm;codecs=vp8,opus',
-      'video/webm',
-    ].find(type => MediaRecorder.isTypeSupported(type))
-
-    const rec = mimeType
-      ? new MediaRecorder(canvasStream, { mimeType })
-      : new MediaRecorder(canvasStream)
+    // 直接录制摄像头原始流（不要绕离屏 canvas.captureStream：
+    // iOS 27 Safari 上离屏 canvas 采集满 300 帧后会停止产出新帧导致画面定格）
+    const rec = createRecorder(stream)
 
     const localChunks: Blob[] = []
 
@@ -223,13 +166,11 @@ async function startRecording() {
       recording.value = false
       paused.value = false
       stopRecordingTimer()
-      cleanupCapture()
     }
 
     rec.onstop = async () => {
       if (recordFailed) {
         recordFailed = false
-        cleanupCapture()
         return
       }
 
@@ -278,7 +219,6 @@ async function startRecording() {
       paused.value = false
       cancelAnimationFrame(rafId)
       stopRecordingTimer()
-      cleanupCapture()
 
       const probed = await probeDuration(videoUrl.value)
       resultDuration.value = Number.isFinite(probed) ? probed : 0
@@ -309,24 +249,10 @@ async function startRecording() {
     startRecordingTimer()
 
     if (promptEl.value) promptEl.value.scrollTop = 0
-    startDrawLoop()
     startScroll()
   } catch (e) {
     error.value = e instanceof Error ? e.message : '启动录像失败'
-    cleanupCapture()
   }
-}
-
-function cleanupCapture() {
-  if (drawRafId) {
-    cancelAnimationFrame(drawRafId)
-    drawRafId = 0
-  }
-  if (canvasStream) {
-    canvasStream.getTracks().forEach(t => t.stop())
-    canvasStream = null
-  }
-  canvasCtx = null
 }
 
 function probeDuration(url: string): Promise<number> {
@@ -352,7 +278,6 @@ function togglePause() {
     }
     paused.value = false
     pausedTotal += performance.now() - pausedAt
-    lastFrameAt = 0
     startScroll()
     startRecordingTimer()
   } else {
@@ -401,7 +326,6 @@ function stopRecording() {
     recorder.stop()
   } else {
     recording.value = false
-    cleanupCapture()
   }
 }
 
@@ -486,7 +410,6 @@ async function saveVideo() {
 onBeforeUnmount(() => {
   cancelAnimationFrame(rafId)
   stopRecordingTimer()
-  cleanupCapture()
   stream?.getTracks().forEach(track => track.stop())
   if (videoUrl.value) URL.revokeObjectURL(videoUrl.value)
 })
