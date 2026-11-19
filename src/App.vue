@@ -20,12 +20,19 @@ const resultDuration = ref(0) // 成片真实时长（秒）
 const durationNote = ref('')
 const dumpNote = ref('')
 
-const VIDEO_BITRATE = 6_000_000
+const CANVAS_W = 1080
+const CANVAS_H = 1920
+const TARGET_FPS = 30
+const FRAME_INTERVAL = 1000 / TARGET_FPS
 
 let stream: MediaStream | null = null
 let recorder: MediaRecorder | null = null
+let canvasStream: MediaStream | null = null
+let canvasCtx: CanvasRenderingContext2D | null = null
 let rafId = 0
+let drawRafId = 0
 let lastTime = 0
+let lastFrameAt = 0
 let scrollOffset = 0
 let recordingTimerId = 0
 let recordStartAt = 0
@@ -33,17 +40,51 @@ let pausedAt = 0
 let pausedTotal = 0
 let recordFailed = false
 
+// ---- 录制诊断：记录摄像头轨、录像器、页面可见性的异常事件，以及画布/编码是否还在出帧 ----
+let diagLog: string[] = []
+let framesDrawn = 0
+let chunkCount = 0
+let diagStop: (() => void) | null = null
+
+function diag(msg: string) {
+  const t = recordStartAt ? (performance.now() - recordStartAt) / 1000 : 0
+  diagLog.push(`${t.toFixed(1)}s ${msg}`)
+}
+
+function watchDiag(rec: MediaRecorder, video: HTMLVideoElement, tracks: MediaStreamTrack[]) {
+  const off: (() => void)[] = []
+  const on = (target: EventTarget, name: string, label: string) => {
+    const fn = () => diag(label)
+    target.addEventListener(name, fn)
+    off.push(() => target.removeEventListener(name, fn))
+  }
+  tracks.forEach(t => {
+    on(t, 'mute', `${t.kind}轨 mute`)
+    on(t, 'unmute', `${t.kind}轨 unmute`)
+    on(t, 'ended', `${t.kind}轨 ended`)
+  })
+  ;(['pause', 'stalled', 'waiting', 'suspend', 'emptied'] as const).forEach(n => on(video, n, `预览 ${n}`))
+  on(rec, 'pause', '录像器 pause')
+  on(rec, 'resume', '录像器 resume')
+  const visibility = () => diag(`页面 ${document.visibilityState}`)
+  document.addEventListener('visibilitychange', visibility)
+  off.push(() => document.removeEventListener('visibilitychange', visibility))
+  return () => off.forEach(fn => fn())
+}
+
 const speedLabel = computed(() => `${speed.value} px/s`)
 
 async function openCamera() {
   error.value = ''
 
   try {
+    // Lock to portrait so iOS Safari has a chance of returning a portrait
+    // MediaStream. Webkit doesn't honor this reliably, but it's worth a try.
     if (screen.orientation?.lock) {
       try {
         await screen.orientation.lock('portrait')
       } catch {
-        // iOS Safari 非全屏下可能拒绝锁定，忽略即可
+        // user denied or unsupported — fall through to landscape stream + canvas
       }
     }
 
@@ -55,9 +96,8 @@ async function openCamera() {
       audio: true,
       video: {
         facingMode: 'user',
-        width: { ideal: 1080 },
-        height: { ideal: 1920 },
-        aspectRatio: { ideal: 9 / 16 },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 },
         frameRate: { ideal: 30, max: 30 },
       }
     })
@@ -107,26 +147,52 @@ function startScroll() {
   rafId = requestAnimationFrame(animateScroll)
 }
 
-function createRecorder(mediaStream: MediaStream): MediaRecorder {
-  const mimeType = [
-    'video/mp4;codecs="avc1.42E028,mp4a.40.2"',
-    'video/mp4',
-    'video/webm;codecs=vp8,opus',
-    'video/webm',
-  ].find(type => MediaRecorder.isTypeSupported(type))
+function drawFrame() {
+  const video = videoEl.value
+  if (!video) return
 
-  try {
-    return new MediaRecorder(
-      mediaStream,
-      mimeType
-        ? { mimeType, videoBitsPerSecond: VIDEO_BITRATE }
-        : { videoBitsPerSecond: VIDEO_BITRATE },
-    )
-  } catch {
-    return mimeType
-      ? new MediaRecorder(mediaStream, { mimeType })
-      : new MediaRecorder(mediaStream)
+  const ctx = canvasCtx
+  if (!ctx) return
+
+  const vw = video.videoWidth || 1920
+  const vh = video.videoHeight || 1080
+
+  ctx.fillStyle = '#000'
+  ctx.fillRect(0, 0, CANVAS_W, CANVAS_H)
+
+  // Fit (letterbox): scale to fit canvas without cropping.
+  const scale = Math.min(CANVAS_W / vw, CANVAS_H / vh)
+  const dw = vw * scale
+  const dh = vh * scale
+
+  ctx.save()
+  ctx.translate(CANVAS_W / 2, CANVAS_H / 2)
+  ctx.scale(-1, 1)
+  ctx.drawImage(video, -dw / 2, -dh / 2, dw, dh)
+  ctx.restore()
+  framesDrawn++
+}
+
+function startDrawLoop() {
+  if (drawRafId) cancelAnimationFrame(drawRafId)
+  lastFrameAt = 0
+
+  const draw = (now: number) => {
+    if (!recording.value) {
+      drawRafId = 0
+      return
+    }
+    drawRafId = requestAnimationFrame(draw)
+
+    if (paused.value) return
+    // 固定帧率：按 TARGET_FPS 节流，避免产出 VFR（可变帧率）视频
+    if (now - lastFrameAt < FRAME_INTERVAL) return
+    lastFrameAt = now
+
+    drawFrame()
   }
+
+  drawRafId = requestAnimationFrame(draw)
 }
 
 async function startRecording() {
@@ -145,17 +211,51 @@ async function startRecording() {
     return
   }
 
+  const video = videoEl.value
+  if (!video) return
+
   error.value = ''
   durationNote.value = ''
 
+  const canvas = document.createElement('canvas')
+  canvas.width = CANVAS_W
+  canvas.height = CANVAS_H
+  canvasCtx = canvas.getContext('2d')
+
   try {
-    // 直接录制摄像头原始流（不要绕离屏 canvas.captureStream：
-    // iOS 27 Safari 上离屏 canvas 采集满 300 帧后会停止产出新帧导致画面定格）
-    const rec = createRecorder(stream)
+    // 固定帧率采集（不要用 captureStream(0)+requestFrame：
+    // iOS Safari 上 requestFrame 不可靠，会只录到一两帧）
+    canvasStream = canvas.captureStream(TARGET_FPS)
+
+    // 直接用麦克风原始音轨（不要绕 AudioContext：
+    // 重新生成的音轨时间戳基准不同，会让 mp4 音轨时间轴错乱）
+    const audioTrack = stream.getAudioTracks()[0]
+    if (audioTrack) canvasStream.addTrack(audioTrack)
+
+    const mimeType = [
+      'video/mp4;codecs="avc1.42E028,mp4a.40.2"',
+      'video/mp4',
+      'video/webm;codecs=vp8,opus',
+      'video/webm',
+    ].find(type => MediaRecorder.isTypeSupported(type))
+
+    const rec = mimeType
+      ? new MediaRecorder(canvasStream, { mimeType })
+      : new MediaRecorder(canvasStream)
 
     const localChunks: Blob[] = []
 
+    diagLog = []
+    framesDrawn = 0
+    chunkCount = 0
+    diagStop?.()
+    diagStop = watchDiag(rec, video, [
+      ...stream.getTracks(),
+      ...canvasStream.getVideoTracks(),
+    ])
+
     rec.ondataavailable = event => {
+      chunkCount++
       if (event.data.size > 0) localChunks.push(event.data)
     }
 
@@ -166,11 +266,13 @@ async function startRecording() {
       recording.value = false
       paused.value = false
       stopRecordingTimer()
+      cleanupCapture()
     }
 
     rec.onstop = async () => {
       if (recordFailed) {
         recordFailed = false
+        cleanupCapture()
         return
       }
 
@@ -219,6 +321,7 @@ async function startRecording() {
       paused.value = false
       cancelAnimationFrame(rafId)
       stopRecordingTimer()
+      cleanupCapture()
 
       const probed = await probeDuration(videoUrl.value)
       resultDuration.value = Number.isFinite(probed) ? probed : 0
@@ -232,6 +335,12 @@ async function startRecording() {
           ? `${durationNote.value} · 成片时长 ${resultDuration.value.toFixed(1)} 秒`
           : `成片时长 ${resultDuration.value.toFixed(1)} 秒`
       }
+
+      // 诊断：停止时画布一共画了多少帧、录像器吐了几次数据、期间出过什么事件
+      diag(`停止：画布共画 ${framesDrawn} 帧，录像器数据块 ${chunkCount} 个`)
+      diagStop?.()
+      diagStop = null
+      durationNote.value = `${durationNote.value}\n【诊断】${diagLog.join('；')}`
     }
 
     recorder = rec
@@ -249,10 +358,24 @@ async function startRecording() {
     startRecordingTimer()
 
     if (promptEl.value) promptEl.value.scrollTop = 0
+    startDrawLoop()
     startScroll()
   } catch (e) {
     error.value = e instanceof Error ? e.message : '启动录像失败'
+    cleanupCapture()
   }
+}
+
+function cleanupCapture() {
+  if (drawRafId) {
+    cancelAnimationFrame(drawRafId)
+    drawRafId = 0
+  }
+  if (canvasStream) {
+    canvasStream.getTracks().forEach(t => t.stop())
+    canvasStream = null
+  }
+  canvasCtx = null
 }
 
 function probeDuration(url: string): Promise<number> {
@@ -278,6 +401,7 @@ function togglePause() {
     }
     paused.value = false
     pausedTotal += performance.now() - pausedAt
+    lastFrameAt = 0
     startScroll()
     startRecordingTimer()
   } else {
@@ -309,6 +433,10 @@ function startRecordingTimer() {
   stopRecordingTimer()
   recordingTimerId = window.setInterval(() => {
     recordingSeconds.value++
+    if (recordingSeconds.value % 4 === 0) {
+      const v = videoEl.value
+      diag(`画布已画 ${framesDrawn} 帧，预览 t=${v ? v.currentTime.toFixed(1) : '?'} ${v?.paused ? '(paused)' : ''}`)
+    }
   }, 1000)
 }
 
@@ -326,6 +454,7 @@ function stopRecording() {
     recorder.stop()
   } else {
     recording.value = false
+    cleanupCapture()
   }
 }
 
@@ -345,39 +474,43 @@ function closeSettings() {
   showSettings.value = false
 }
 
-// async function copyDiagnostics() {
-//   const text = [
-//     durationNote.value,
-//     '',
-//     '--- mp4 结构 ---',
-//     dumpNote.value,
-//   ].join('\n')
-//
-//   try {
-//     await navigator.clipboard.writeText(text)
-//     error.value = '诊断信息已复制到剪贴板'
-//   } catch {
-//     error.value = '复制失败，请手动截图上面的诊断行'
-//   }
-// }
-//
-// async function uploadToDev() {
-//   if (!videoUrl.value) return
-//   try {
-//     const blob = await (await fetch(videoUrl.value)).blob()
-//     const name = `teleprompter-${Date.now()}.${blob.type.includes('mp4') ? 'mp4' : 'webm'}`
-//     const nameBytes = new TextEncoder().encode(name)
-//     const header = new Uint8Array(4 + nameBytes.length)
-//     new DataView(header.buffer).setUint32(0, nameBytes.length)
-//     header.set(nameBytes, 4)
-//     const body = new Blob([header, blob])
-//     const res = await fetch('/upload', { method: 'POST', body })
-//     const text = await res.text()
-//     error.value = res.ok ? `已上传：${text}` : `上传失败：${text}`
-//   } catch (e) {
-//     error.value = `上传失败：${e instanceof Error ? e.message : e}`
-//   }
-// }
+// 排查用：只有 `npm run dev` 的开发服务器带 /upload 转发，线上页面没有这个接口，所以只在开发环境显示按钮
+const isDev = import.meta.env.DEV
+
+async function copyDiagnostics() {
+  const text = [
+    durationNote.value,
+    '',
+    '--- mp4 结构 ---',
+    dumpNote.value,
+  ].join('\n')
+
+  try {
+    await navigator.clipboard.writeText(text)
+    error.value = '诊断信息已复制到剪贴板'
+  } catch {
+    error.value = '复制失败，请手动截图上面的诊断行'
+  }
+}
+
+async function uploadToDev() {
+  if (!videoUrl.value) return
+  error.value = '正在上传…'
+  try {
+    const blob = await (await fetch(videoUrl.value)).blob()
+    const name = `teleprompter-${Date.now()}.${blob.type.includes('mp4') ? 'mp4' : 'webm'}`
+    const nameBytes = new TextEncoder().encode(name)
+    const header = new Uint8Array(4 + nameBytes.length)
+    new DataView(header.buffer).setUint32(0, nameBytes.length)
+    header.set(nameBytes, 4)
+    const body = new Blob([header, blob])
+    const res = await fetch('/upload', { method: 'POST', body })
+    const text = await res.text()
+    error.value = res.ok ? `已上传：${text}` : `上传失败：${text}`
+  } catch (e) {
+    error.value = `上传失败：${e instanceof Error ? e.message : e}`
+  }
+}
 
 async function saveVideo() {
   if (!videoUrl.value) return
@@ -410,6 +543,7 @@ async function saveVideo() {
 onBeforeUnmount(() => {
   cancelAnimationFrame(rafId)
   stopRecordingTimer()
+  cleanupCapture()
   stream?.getTracks().forEach(track => track.stop())
   if (videoUrl.value) URL.revokeObjectURL(videoUrl.value)
 })
@@ -509,8 +643,10 @@ onBeforeUnmount(() => {
     <section v-if="videoUrl" class="result">
       <h2>录制完成</h2>
       <p v-if="durationNote" class="duration-note">{{ durationNote }}</p>
-<!--      <button class="ghost" @click="copyDiagnostics">复制诊断信息</button>-->
-<!--      <button class="ghost" @click="uploadToDev">上传到开发机（排查用）</button>-->
+      <template v-if="isDev">
+        <button class="ghost" @click="copyDiagnostics">复制诊断信息</button>
+        <button class="ghost" @click="uploadToDev">上传到开发机（排查用）</button>
+      </template>
       <video :src="videoUrl" controls playsinline class="result-video" />
       <button @click="saveVideo">导出 / 保存视频</button>
     </section>
