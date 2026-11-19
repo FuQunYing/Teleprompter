@@ -290,6 +290,11 @@ async function startRecording() {
         const parts = [`录制 ${elapsed.toFixed(1)}s`]
         parts.push(fixed.changed ? `容器时长已修正 → ${fixed.targetDuration.toFixed(1)}s` : '容器时长未改动')
         parts.push(`原始标注 ${stored.toFixed(1)}s`)
+        // Safari 实际写出了哪些轨、各有多少样本；没有音轨时在这里一眼能看出来
+        parts.push(`录像器原始轨道：${fixed.analysis.tracks.map(t => `${t.kind} ${t.sampleCount}样本`).join(' / ') || '无'}`)
+        if (!fixed.analysis.tracks.some(t => t.kind === 'soun' && t.sampleCount > 0)) {
+          parts.push('⚠ 录像器没有写入任何音频')
+        }
         if (fixed.report) parts.push(fixed.report)
         durationNote.value = parts.join(' ｜ ')
       } catch (e) {
@@ -353,6 +358,11 @@ async function startRecording() {
     recordStartAt = performance.now()
     pausedAt = 0
     pausedTotal = 0
+
+    // 诊断：开录那一刻，麦克风/摄像头轨是不是活的、有没有被静音
+    const describe = (t: MediaStreamTrack) =>
+      `${t.kind}[${t.readyState}${t.muted ? ',muted' : ''}${t.enabled ? '' : ',disabled'}]`
+    diag(`摄像头流 ${stream.getTracks().map(describe).join(' ') || '无轨'}；录像流 ${canvasStream?.getTracks().map(describe).join(' ') || '无轨'}；类型 ${rec.mimeType}`)
     scrollOffset = 0
     recordingSeconds.value = 0
     startRecordingTimer()
