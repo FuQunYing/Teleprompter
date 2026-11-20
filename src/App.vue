@@ -23,6 +23,7 @@ const dumpNote = ref('')
 const CANVAS_W = 1080
 const CANVAS_H = 1920
 const TARGET_FPS = 30
+const VIDEO_BITRATE = 4_000_000
 const FRAME_INTERVAL = 1000 / TARGET_FPS
 
 let stream: MediaStream | null = null
@@ -42,6 +43,8 @@ let recordFailed = false
 
 // ---- 录制诊断：记录摄像头轨、录像器、页面可见性的异常事件，以及画布/编码是否还在出帧 ----
 let diagLog: string[] = []
+let camLog: string[] = []
+let recordCount = 0
 let framesDrawn = 0
 let chunkCount = 0
 let diagStop: (() => void) | null = null
@@ -106,6 +109,17 @@ async function openCamera() {
       videoEl.value.srcObject = stream
       await videoEl.value.play()
     }
+
+    // 诊断：预览期间摄像头/麦克风轨有没有被系统静音或结束
+    camLog = []
+    const openedAt = performance.now()
+    stream.getTracks().forEach(t => {
+      ;(['mute', 'unmute', 'ended'] as const).forEach(name => {
+        t.addEventListener(name, () => {
+          camLog.push(`预览${((performance.now() - openedAt) / 1000).toFixed(0)}s ${t.kind} ${name}`)
+        })
+      })
+    })
 
     cameraReady.value = true
   } catch (e) {
@@ -239,9 +253,18 @@ async function startRecording() {
       'video/webm',
     ].find(type => MediaRecorder.isTypeSupported(type))
 
-    const rec = mimeType
-      ? new MediaRecorder(canvasStream, { mimeType })
-      : new MediaRecorder(canvasStream)
+    // 实验：默认码率约 14 Mbps，某台手机上录到 ~20MB 左右视频就不再出帧。
+    // 先只降码率到 4 Mbps，看停的时间会不会推迟，用来区分是「数据量」还是「时间」相关。
+    let rec: MediaRecorder
+    try {
+      rec = new MediaRecorder(canvasStream, mimeType
+        ? { mimeType, videoBitsPerSecond: VIDEO_BITRATE }
+        : { videoBitsPerSecond: VIDEO_BITRATE })
+    } catch {
+      rec = mimeType
+        ? new MediaRecorder(canvasStream, { mimeType })
+        : new MediaRecorder(canvasStream)
+    }
 
     const localChunks: Blob[] = []
 
@@ -283,20 +306,21 @@ async function startRecording() {
       const elapsed = Math.max(0, (performance.now() - recordStartAt - pausedTotal) / 1000)
 
       // 1) 修正容器时长：Safari 写出来的 mp4 里 mvhd/mdhd/tkhd 的 duration 是 0 或错的
+      let missingAudio = false
       try {
         const fixed = await fixMp4Duration(blob, elapsed)
         blob = fixed.blob
-        const stored = fixed.analysis.storedMovieDuration / fixed.analysis.movieTimescale
-        const parts = [`录制 ${elapsed.toFixed(1)}s`]
-        parts.push(fixed.changed ? `容器时长已修正 → ${fixed.targetDuration.toFixed(1)}s` : '容器时长未改动')
-        parts.push(`原始标注 ${stored.toFixed(1)}s`)
-        // Safari 实际写出了哪些轨、各有多少样本；没有音轨时在这里一眼能看出来
-        parts.push(`录像器原始轨道：${fixed.analysis.tracks.map(t => `${t.kind} ${t.sampleCount}样本`).join(' / ') || '无'}`)
-        if (!fixed.analysis.tracks.some(t => t.kind === 'soun' && t.sampleCount > 0)) {
-          parts.push('⚠ 录像器没有写入任何音频')
+        missingAudio = !fixed.analysis.tracks.some(t => t.kind === 'soun' && t.sampleCount > 0)
+        if (isDev) {
+          const stored = fixed.analysis.storedMovieDuration / fixed.analysis.movieTimescale
+          const parts = [`录制 ${elapsed.toFixed(1)}s`]
+          parts.push(fixed.changed ? `容器时长已修正 → ${fixed.targetDuration.toFixed(1)}s` : '容器时长未改动')
+          parts.push(`原始标注 ${stored.toFixed(1)}s`)
+          parts.push(`录像器原始轨道：${fixed.analysis.tracks.map(t => `${t.kind} ${t.sampleCount}样本`).join(' / ') || '无'}`)
+          if (missingAudio) parts.push('⚠ 录像器没有写入任何音频')
+          if (fixed.report) parts.push(fixed.report)
+          durationNote.value = parts.join(' ｜ ')
         }
-        if (fixed.report) parts.push(fixed.report)
-        durationNote.value = parts.join(' ｜ ')
       } catch (e) {
         console.warn('修正 mp4 时长失败', e)
       }
@@ -309,11 +333,13 @@ async function startRecording() {
         const prog = await toProgressiveMp4(blob)
         if (prog.changed) {
           blob = prog.blob
-          const detail = prog.tracks.map(t => {
-            const keys = t.kind === 'vide' && t.syncSamples ? ` ${t.syncSamples}个关键帧` : ''
-            return `${t.kind} ${t.samples}帧${keys} ${t.duration.toFixed(1)}s`
-          }).join(' / ')
-          durationNote.value = `${durationNote.value} ｜ 已转为标准 mp4（${detail}）`
+          if (isDev) {
+            const detail = prog.tracks.map(t => {
+              const keys = t.kind === 'vide' && t.syncSamples ? ` ${t.syncSamples}个关键帧` : ''
+              return `${t.kind} ${t.samples}帧${keys} ${t.duration.toFixed(1)}s`
+            }).join(' / ')
+            durationNote.value = `${durationNote.value} ｜ 已转为标准 mp4（${detail}）`
+          }
         }
       } catch (e) {
         console.warn('转换 mp4 失败', e)
@@ -330,28 +356,36 @@ async function startRecording() {
 
       const probed = await probeDuration(videoUrl.value)
       resultDuration.value = Number.isFinite(probed) ? probed : 0
-      try {
-        dumpNote.value = await dumpMp4Structure(blob)
-      } catch (e) {
-        console.warn('导出 mp4 结构失败', e)
+      if (isDev) {
+        try {
+          dumpNote.value = await dumpMp4Structure(blob)
+        } catch (e) {
+          console.warn('导出 mp4 结构失败', e)
+        }
       }
       if (resultDuration.value > 0) {
         durationNote.value = durationNote.value
           ? `${durationNote.value} · 成片时长 ${resultDuration.value.toFixed(1)} 秒`
           : `成片时长 ${resultDuration.value.toFixed(1)} 秒`
       }
+      if (!isDev && missingAudio) {
+        durationNote.value = `${durationNote.value ? `${durationNote.value} ｜ ` : ''}⚠ 本次录像未录到声音，请检查麦克风是否被占用`
+      }
 
       // 诊断：停止时画布一共画了多少帧、录像器吐了几次数据、期间出过什么事件
       diag(`停止：画布共画 ${framesDrawn} 帧，录像器数据块 ${chunkCount} 个`)
       diagStop?.()
       diagStop = null
-      durationNote.value = `${durationNote.value}\n【诊断】${diagLog.join('；')}`
+      if (isDev) {
+        durationNote.value = `${durationNote.value}\n【诊断】${diagLog.join('；')}`
+      }
     }
 
     recorder = rec
     recordFailed = false
-    // 不带 timeslice：让 Safari 走常规 muxer 路径，产出带完整 moov 的 mp4
-    rec.start()
+    // 每 1000ms 刷出一个分片：避免 Safari 把整场音视频一直憋在单个内存缓冲里（约 15~20MB 后停止收视频帧），
+    // 停止录制后由 toProgressiveMp4 把所有 moof+mdat 分片合并成标准 mp4。
+    rec.start(1000)
 
     recording.value = true
     paused.value = false
@@ -362,7 +396,9 @@ async function startRecording() {
     // 诊断：开录那一刻，麦克风/摄像头轨是不是活的、有没有被静音
     const describe = (t: MediaStreamTrack) =>
       `${t.kind}[${t.readyState}${t.muted ? ',muted' : ''}${t.enabled ? '' : ',disabled'}]`
-    diag(`摄像头流 ${stream.getTracks().map(describe).join(' ') || '无轨'}；录像流 ${canvasStream?.getTracks().map(describe).join(' ') || '无轨'}；类型 ${rec.mimeType}`)
+    recordCount++
+    diag(`本页第 ${recordCount} 次录制；预览期事件：${camLog.join('、') || '无'}`)
+    diag(`摄像头流 ${stream.getTracks().map(describe).join(' ') || '无轨'}；录像流 ${canvasStream?.getTracks().map(describe).join(' ') || '无轨'}；类型 ${rec.mimeType}；视频码率 ${rec.videoBitsPerSecond}；画布 ${CANVAS_W}x${CANVAS_H}`)
     scrollOffset = 0
     recordingSeconds.value = 0
     startRecordingTimer()
@@ -382,7 +418,10 @@ function cleanupCapture() {
     drawRafId = 0
   }
   if (canvasStream) {
-    canvasStream.getTracks().forEach(t => t.stop())
+    // 只停画布自己的视频轨。音轨是从摄像头流里借来的同一条麦克风轨，
+    // 停掉它会让同一页面里下一次录制没有声音。
+    canvasStream.getVideoTracks().forEach(t => t.stop())
+    canvasStream.getAudioTracks().forEach(t => canvasStream?.removeTrack(t))
     canvasStream = null
   }
   canvasCtx = null
